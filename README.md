@@ -38,7 +38,7 @@ PORT=8080 node server.js
 SERVER_PORT=8080 node server.js
 ```
 
-- On first start, the server creates a `token` file in its directory. This file contains a random 64‑byte hex string. **Copy this token** – you will need it for the client.
+- On first start, the server creates a `token` file in its directory. This file contains a random 64‑byte hex string. **Copy this token**, you will need it for the client.
 
 - The server automatically creates a `server-logs/` folder and writes a new log file per run (timestamped).
 
@@ -186,7 +186,7 @@ These statistics are console‑only and are not written to log files.
 
 ## License
 
-MIT – free to use, modify, and distribute.
+MIT, free to use, modify, and distribute.
 
 ---
 
