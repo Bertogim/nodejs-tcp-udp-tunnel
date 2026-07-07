@@ -1,0 +1,759 @@
+// client.js
+
+// By Bertogim
+// v1.0.0
+
+const net = require("net");
+const dgram = require("dgram");
+const fs = require("fs");
+const path = require("path");
+
+// Setup logging
+const logsDir = path.join(__dirname, 'worker-logs');
+if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+
+const getLogFileName = () => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  return `${year}-${month}-${day}_${hours}-${minutes}-${seconds}.txt`;
+};
+
+let logFilePath = path.join(logsDir, getLogFileName());
+let logStream = fs.createWriteStream(logFilePath, { flags: "a" });
+
+function ensureLogStream() {
+  if (logStream && !logStream.destroyed) return;
+  logFilePath = path.join(logsDir, getLogFileName());
+  logStream = fs.createWriteStream(logFilePath, { flags: "a" });
+  logStream.on("error", (err) => {
+    originalLog.call(console, `[log-stream-error] ${err.message}`);
+  });
+}
+
+const originalLog = console.log;
+console.log = function (...args) {
+  const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
+  const timestamp = new Date().toISOString();
+  const logLine = `[${timestamp}] ${message}\n`;
+  ensureLogStream();
+  logStream.write(logLine);
+  originalLog.apply(console, args);
+};
+
+const consoleOnly = function (...args) {
+  originalLog.apply(console, args);
+};
+
+function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TCP_PORT, LOCAL_UDP_HOST, LOCAL_UDP_PORT, ENABLE_HTTP_PORT, LOCAL_HTTP_HOST, LOCAL_HTTP_PORT) {
+
+  const BUFFER_SIZE = 256 * 1024; // 256KB
+
+  // Message types
+  const MSG_TYPE = {
+    TCP_OPEN: 0x01,
+    TCP_DATA: 0x02,
+    TCP_CLOSE: 0x03,
+    UDP_IN: 0x04,
+    UDP_OUT: 0x05,
+    AUTH_HELLO: 0x10,
+    AUTH_OK: 0x11,
+    AUTH_FAIL: 0x12,
+    HEARTBEAT_PING: 0x20,
+    HEARTBEAT_PONG: 0x21,
+    TCP_PAUSE: 0x30,
+    TCP_RESUME: 0x31,
+  };
+
+  const CONTROL_KEEPALIVE_DELAY_MS = 30_000;
+  const HEARTBEAT_INTERVAL_MS = 15_000;
+  const HEARTBEAT_TIMEOUT_MS = 45_000;
+  const UDP_TUNNEL_HELLO_INTERVAL_MS = 10_000;
+  const WORKER_UDP_AUTH_PREFIX = "TUN1UDP";
+
+  const tcpSessions = new Map(); // sid -> { socket, ready, pending: Buffer[], port, host, writeBlocked, _drainListenerAttached }
+  const udpSessions = new Map(); // srcKey -> { socket, ready, pending }
+
+  let control = null;
+  let udpControl = null;
+  let controlAuthenticated = false;
+  let udpControlAuthenticated = false;
+  let heartbeatInterval = null;
+  let udpHelloInterval = null;
+  let lastHeartbeatAt = 0;
+
+  // ---- Backpressure: local -> control ----
+  const pausedLocalSockets = new Set();
+
+  function onControlDrain() {
+    for (const sock of pausedLocalSockets) {
+      sock.resume();
+    }
+    pausedLocalSockets.clear();
+  }
+
+  // ---- Backpressure: control -> local ----
+  let blockedWritesCount = 0;
+
+  function pauseControlIfNeeded() {
+    if (control && !control.isPaused()) {
+      control.pause();
+    }
+  }
+
+  function resumeControlIfPossible() {
+    if (blockedWritesCount === 0 && control && control.isPaused()) {
+      control.resume();
+    }
+  }
+
+  setInterval(() => {
+    const workerTcpStatus = (control && !control.destroyed && controlAuthenticated) ? "YES" : "NO";
+    const workerUdpStatus = (udpControl && !udpControl.destroyed && udpControlAuthenticated) ? "YES" : "NO";
+    const tcpCount = tcpSessions.size;
+    const udpCount = udpSessions.size;
+
+    consoleOnly("Stats for:", VPS_NAME);
+    consoleOnly("Worker TCP:", workerTcpStatus);
+    consoleOnly("TCP Sessions:", tcpCount);
+    consoleOnly("\nWorker UDP:", workerUdpStatus);
+    consoleOnly("UDP Sessions:", udpCount);
+    consoleOnly("\n")
+  }, 5000);
+
+  // ==================== Length-Prefixed Binary Protocol ====================
+
+  function encodeMessage(type, sid, data) {
+    const dataLen = data ? data.length : 0;
+    const payloadLen = 1 + 4 + 4 + dataLen;
+    const totalLen = 4 + payloadLen;
+
+    const buf = Buffer.allocUnsafe(totalLen);
+    buf.writeUInt32BE(totalLen, 0);
+    buf.writeUInt8(type, 4);
+    buf.writeUInt32BE(sid, 5);
+    buf.writeUInt32BE(dataLen, 9);
+
+    if (data && dataLen > 0) {
+      data.copy(buf, 13);
+    }
+
+    return buf;
+  }
+
+  function createBinaryParser(onMessage) {
+    let buffer = Buffer.allocUnsafe(BUFFER_SIZE);
+    let offset = 0;
+
+    return (chunk) => {
+      if (offset + chunk.length > buffer.length) {
+        const newSize = Math.max(buffer.length * 2, offset + chunk.length);
+        const newBuf = Buffer.allocUnsafe(newSize);
+        buffer.copy(newBuf, 0, 0, offset);
+        buffer = newBuf;
+      }
+      chunk.copy(buffer, offset);
+      offset += chunk.length;
+
+      let pos = 0;
+      while (pos + 4 <= offset) {
+        const msgLen = buffer.readUInt32BE(pos);
+
+        if (msgLen < 13 || msgLen > 1024 * 1024) {
+          pos++;
+          continue;
+        }
+
+        if (offset - pos < msgLen) break;
+
+        const type = buffer[pos + 4];
+        const sid = buffer.readUInt32BE(pos + 5);
+        const dataLen = buffer.readUInt32BE(pos + 9);
+
+        const expectedPayloadLen = 1 + 4 + 4 + dataLen;
+        const expectedTotalLen = 4 + expectedPayloadLen;
+
+        if (msgLen !== expectedTotalLen) {
+          pos++;
+          continue;
+        }
+
+        const data = dataLen > 0 ? Buffer.from(buffer.slice(pos + 13, pos + 13 + dataLen)) : null;
+
+        try { onMessage({ type, sid, data }); } catch (e) { console.log("[-] error processing message:", e.message); }
+        pos += msgLen;
+      }
+
+      if (pos > 0) {
+        if (pos < offset) {
+          buffer.copy(buffer, 0, pos, offset);
+        }
+        offset -= pos;
+      }
+
+      if (offset > 0 && buffer.length > BUFFER_SIZE * 4) {
+        const newBuf = Buffer.allocUnsafe(Math.max(BUFFER_SIZE, offset));
+        buffer.copy(newBuf, 0, 0, offset);
+        buffer = newBuf;
+      }
+    };
+  }
+
+  function decodeSingleMessage(packet) {
+    if (!packet || packet.length < 13) return null;
+
+    const msgLen = packet.readUInt32BE(0);
+    if (msgLen !== packet.length || msgLen > 1024 * 1024) return null;
+
+    const type = packet.readUInt8(4);
+    const sid = packet.readUInt32BE(5);
+    const dataLen = packet.readUInt32BE(9);
+    const expectedTotalLen = 13 + dataLen;
+
+    if (msgLen !== expectedTotalLen) return null;
+
+    return {
+      type,
+      sid,
+      data: dataLen > 0 ? packet.subarray(13, 13 + dataLen) : null,
+    };
+  }
+
+  function sendMessage(type, sid, data) {
+    if (!control || control.destroyed) return true; // without control, no restriction
+    const msg = encodeMessage(type, sid, data);
+    return control.write(msg);
+  }
+
+  function sendUdpTunnelMessage(type, sid, data) {
+    if (!udpControl) return false;
+
+    const packet = encodeMessage(type, sid, data);
+    udpControl.send(packet, (err) => {
+      if (err) {
+        console.log(`[-] udp tunnel send error: ${err.message}`);
+      }
+    });
+    return true;
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+      heartbeatInterval = null;
+    }
+  }
+
+  function stopUdpHello() {
+    if (udpHelloInterval) {
+      clearInterval(udpHelloInterval);
+      udpHelloInterval = null;
+    }
+  }
+
+  function sendUdpHello() {
+    sendUdpTunnelMessage(MSG_TYPE.AUTH_HELLO, 0, Buffer.from(`${WORKER_UDP_AUTH_PREFIX} ${TOKEN}`));
+  }
+
+  function startUdpHello() {
+    stopUdpHello();
+    sendUdpHello();
+    udpHelloInterval = setInterval(() => {
+      sendUdpHello();
+    }, UDP_TUNNEL_HELLO_INTERVAL_MS);
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    lastHeartbeatAt = Date.now();
+
+    heartbeatInterval = setInterval(() => {
+      if (!control || control.destroyed || !controlAuthenticated) return;
+
+      const now = Date.now();
+      if (now - lastHeartbeatAt > HEARTBEAT_TIMEOUT_MS) {
+        console.log("[-] heartbeat timeout, reconnecting control tunnel");
+        try { control.destroy(); } catch { }
+        return;
+      }
+
+      sendMessage(MSG_TYPE.HEARTBEAT_PING, 0, null);
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  function closeAllSessions() {
+    for (const [, s] of tcpSessions) {
+      try { s.socket.destroy(); } catch { }
+      s.pending = []; // free queues
+    }
+    tcpSessions.clear();
+    pausedLocalSockets.clear();
+    blockedWritesCount = 0;
+    resumeControlIfPossible();
+
+    for (const [, s] of udpSessions) {
+      try { s.socket.close(); } catch { }
+      s.pending = [];
+    }
+    udpSessions.clear();
+  }
+
+  // Helper to establish local connection (TCP or HTTP)
+  function connectLocal(sid, s) {
+    // If already have a socket, do nothing
+    if (s.socket) return;
+
+    const sock = net.connect({ port: s.port, host: s.host, highWaterMark: BUFFER_SIZE });
+    sock.setNoDelay(true);
+    s.socket = sock;
+    s._reconnecting = false;
+
+    sock.on("connect", () => {
+      s.ready = true;
+      console.log(`[*] local TCP session ${sid} connected to ${s.host}:${s.port}`);
+      for (const chunk of s.pending) sock.write(chunk);
+      s.pending = [];
+    });
+
+    sock.on("data", (chunk) => {
+      const ok = sendMessage(MSG_TYPE.TCP_DATA, sid, chunk);
+      if (!ok && !pausedLocalSockets.has(sock)) {
+        sock.pause();
+        pausedLocalSockets.add(sock);
+      }
+    });
+
+    sock.on("close", () => {
+      if (!s._reconnecting) {
+        console.log(`[-] local TCP session ${sid} closed`);
+        sendMessage(MSG_TYPE.TCP_CLOSE, sid, null);
+        pausedLocalSockets.delete(sock);
+        if (s.writeBlocked) {
+          s.writeBlocked = false;
+          blockedWritesCount--;
+          resumeControlIfPossible();
+        }
+        // Clear pending to free memory
+        s.pending = [];
+        tcpSessions.delete(String(sid));
+      } else {
+        s.socket = null;
+        s.ready = false;
+      }
+    });
+
+    sock.on("error", (err) => {
+      console.log(`[-] local TCP session ${sid} error: ${err.message}`);
+      if (
+        ENABLE_HTTP_PORT &&
+        s.port === LOCAL_HTTP_PORT &&
+        s.host === LOCAL_HTTP_HOST &&
+        (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND')
+      ) {
+        console.log(`[*] HTTP port not available, falling back to TCP for session ${sid}`);
+        s._reconnecting = true;
+        s.port = LOCAL_TCP_PORT;
+        s.host = LOCAL_TCP_HOST;
+        try { sock.destroy(); } catch { }
+        connectLocal(sid, s);
+      } else {
+        try { sock.destroy(); } catch { }
+      }
+    });
+  }
+
+  function handleTcpData(sid, data) {
+    const s = tcpSessions.get(String(sid));
+    if (!s) return;
+
+    if (!s.socket && ENABLE_HTTP_PORT) {
+      let port = LOCAL_TCP_PORT;
+      let host = LOCAL_TCP_HOST;
+
+      if (data && data.length > 0) {
+        const str = data.toString("ascii", 0, Math.min(10, data.length));
+        if (/^[A-Z]+\s/.test(str)) {
+          port = LOCAL_HTTP_PORT;
+          host = LOCAL_HTTP_HOST;
+        }
+      }
+      s.port = port;
+      s.host = host;
+      connectLocal(sid, s);
+      s.pending.push(data);
+      return;
+    }
+
+    if (!s.socket) {
+      s.port = LOCAL_TCP_PORT;
+      s.host = LOCAL_TCP_HOST;
+      connectLocal(sid, s);
+      s.pending.push(data);
+      return;
+    }
+
+    if (s.ready) {
+      const canWrite = s.socket.write(data);
+      if (!canWrite && !s.writeBlocked) {
+        s.writeBlocked = true;
+        blockedWritesCount++;
+        pauseControlIfNeeded();
+        if (!s._drainListenerAttached) {
+          s._drainListenerAttached = true;
+          s.socket.once("drain", () => {
+            if (s.writeBlocked) {
+              s.writeBlocked = false;
+              blockedWritesCount--;
+              resumeControlIfPossible();
+            }
+            s._drainListenerAttached = false;
+          });
+        }
+      }
+    } else {
+      s.pending.push(data);
+    }
+  }
+
+  function createTcpSession(sid) {
+    const state = {
+      socket: null,
+      ready: false,
+      pending: [],
+      port: LOCAL_TCP_PORT,
+      host: LOCAL_TCP_HOST,
+      writeBlocked: false,
+      _drainListenerAttached: false,
+    };
+
+    tcpSessions.set(String(sid), state);
+
+    if (ENABLE_HTTP_PORT) {
+      return;
+    }
+
+    const sock = net.connect({ port: state.port, host: state.host, highWaterMark: BUFFER_SIZE });
+    sock.setNoDelay(true);
+    state.socket = sock;
+
+    sock.on("connect", () => {
+      state.ready = true;
+      console.log(`[*] local TCP session ${sid} connected to ${state.host}:${state.port}`);
+      for (const chunk of state.pending) sock.write(chunk);
+      state.pending = [];
+    });
+
+    sock.on("data", (chunk) => {
+      const ok = sendMessage(MSG_TYPE.TCP_DATA, sid, chunk);
+      if (!ok && !pausedLocalSockets.has(sock)) {
+        sock.pause();
+        pausedLocalSockets.add(sock);
+      }
+    });
+
+    sock.on("close", () => {
+      console.log(`[-] local TCP session ${sid} closed`);
+      sendMessage(MSG_TYPE.TCP_CLOSE, sid, null);
+      pausedLocalSockets.delete(sock);
+      if (state.writeBlocked) {
+        state.writeBlocked = false;
+        blockedWritesCount--;
+        resumeControlIfPossible();
+      }
+      state.pending = []; // free
+      tcpSessions.delete(String(sid));
+    });
+
+    sock.on("error", (err) => {
+      console.log(`[-] local TCP session ${sid} error: ${err.message}`);
+      try { sock.destroy(); } catch { }
+    });
+  }
+
+  function getUdpSession(srcKey) {
+    let s = udpSessions.get(srcKey);
+    if (s) return s;
+
+    const sock = dgram.createSocket("udp4");
+    const state = { socket: sock, ready: false, pending: [] };
+
+    sock.on("error", (err) => {
+      console.log(`[-] UDP session ${srcKey} error: ${err.message}`);
+      try { sock.close(); } catch { }
+    });
+
+    sock.on("message", (msg) => {
+      const srcKeyBuf = Buffer.from(srcKey);
+      const data = Buffer.concat([srcKeyBuf, Buffer.from([0]), msg]);
+      if (!udpControlAuthenticated || !sendUdpTunnelMessage(MSG_TYPE.UDP_OUT, 0, data)) {
+        sendMessage(MSG_TYPE.UDP_OUT, 0, data);
+      }
+    });
+
+    console.log(`[*] UDP session ${srcKey} creating local socket to ${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT}`);
+    sock.connect(LOCAL_UDP_PORT, LOCAL_UDP_HOST, () => {
+      state.ready = true;
+      console.log(`[*] UDP session ${srcKey} connected to local ${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT}`);
+      for (const buf of state.pending) {
+        sock.send(buf, (err) => {
+          if (err) {
+            console.log(`[-] UDP session ${srcKey} send error: ${err.message}`);
+          } else {
+            console.log(`[*] UDP session ${srcKey} flushed ${buf.length} bytes pending`);
+          }
+        });
+      }
+      state.pending = [];
+    });
+
+    s = state;
+    udpSessions.set(srcKey, s);
+    return s;
+  }
+
+  function handleServerMessage(msg) {
+    try {
+      const { type, sid, data } = msg;
+
+      if (type === MSG_TYPE.TCP_OPEN) {
+        createTcpSession(sid);
+        return;
+      }
+
+      if (type === MSG_TYPE.TCP_DATA) {
+        handleTcpData(sid, data);
+        return;
+      }
+
+      if (type === MSG_TYPE.TCP_CLOSE) {
+        const s = tcpSessions.get(String(sid));
+        if (s) {
+          try { s.socket.destroy(); } catch { }
+          s.pending = [];
+          tcpSessions.delete(String(sid));
+        }
+        return;
+      }
+
+      // Pause/resume: the server may send them, but we handle carefully
+      if (type === MSG_TYPE.TCP_PAUSE) {
+        const s = tcpSessions.get(String(sid));
+        if (s && s.socket && !s.socket.destroyed) {
+          s.socket.pause();
+          console.log(`[*] Session ${sid} paused (received from server)`);
+        }
+        return;
+      }
+
+      if (type === MSG_TYPE.TCP_RESUME) {
+        const s = tcpSessions.get(String(sid));
+        if (s && s.socket && !s.socket.destroyed) {
+          s.socket.resume();
+          console.log(`[*] Session ${sid} resumed (received from server)`);
+        }
+        return;
+      }
+
+      if (type === MSG_TYPE.UDP_IN) {
+        const nullIdx = data.indexOf(0);
+        if (nullIdx === -1) return;
+        const srcKey = data.slice(0, nullIdx).toString();
+        const payload = data.slice(nullIdx + 1);
+
+        const s = getUdpSession(srcKey);
+        if (s.ready) {
+          s.socket.send(payload, (err) => {
+            if (err) console.log(`[-] UDP send error for ${srcKey}: ${err.message}`);
+          });
+        } else {
+          s.pending.push(payload);
+        }
+        return;
+      }
+
+      if (type === MSG_TYPE.AUTH_OK) {
+        controlAuthenticated = true;
+        lastHeartbeatAt = Date.now();
+        startHeartbeat();
+        console.log("[+] authenticated");
+        return;
+      }
+
+      if (type === MSG_TYPE.AUTH_FAIL) {
+        console.log("[-] auth failed");
+        control.destroy();
+        return;
+      }
+
+      if (type === MSG_TYPE.HEARTBEAT_PING) {
+        lastHeartbeatAt = Date.now();
+        sendMessage(MSG_TYPE.HEARTBEAT_PONG, 0, null);
+        return;
+      }
+
+      if (type === MSG_TYPE.HEARTBEAT_PONG) {
+        lastHeartbeatAt = Date.now();
+        return;
+      }
+    } catch (e) {
+      console.log("[-] bad frame:", e.message);
+    }
+  }
+
+  function handleUdpTunnelMessage(packet) {
+    const msg = decodeSingleMessage(packet);
+    if (!msg) return;
+
+    try {
+      const { type, data } = msg;
+
+      if (type === MSG_TYPE.AUTH_OK) {
+        if (!udpControlAuthenticated) {
+          udpControlAuthenticated = true;
+          console.log("[+] UDP tunnel authenticated");
+        }
+        return;
+      }
+
+      if (type !== MSG_TYPE.UDP_IN || !data) return;
+
+      const nullIdx = data.indexOf(0);
+      if (nullIdx === -1) return;
+      const srcKey = data.slice(0, nullIdx).toString();
+      const payload = data.slice(nullIdx + 1);
+
+      const s = getUdpSession(srcKey);
+      if (s.ready) {
+        s.socket.send(payload, (err) => {
+          if (err) console.log(`[-] UDP send error for ${srcKey}: ${err.message}`);
+        });
+      } else {
+        s.pending.push(payload);
+      }
+    } catch (e) {
+      console.log(`[-] bad udp tunnel frame: ${e.message}`);
+    }
+  }
+
+  function connectUdpControl() {
+    if (udpControl) {
+      stopUdpHello();
+      udpControlAuthenticated = false;
+      try { udpControl.close(); } catch { }
+    }
+
+    udpControl = dgram.createSocket("udp4");
+    udpControlAuthenticated = false;
+
+    udpControl.on("message", handleUdpTunnelMessage);
+    udpControl.on("error", (err) => {
+      console.log(`[-] udp control socket error: ${err.message}`);
+    });
+    udpControl.on("close", () => {
+      udpControlAuthenticated = false;
+      stopUdpHello();
+      setTimeout(connectUdpControl, 2000);
+    });
+
+    udpControl.connect(VPS_PORT, VPS_IP, () => {
+      console.log("[+] UDP tunnel connected to VPS");
+      startUdpHello();
+    });
+  }
+
+  function connectControl() {
+    console.log("[*] connecting...");
+    controlAuthenticated = false;
+    stopHeartbeat();
+
+    control = net.connect({ port: VPS_PORT, host: VPS_IP, highWaterMark: BUFFER_SIZE }, () => {
+      console.log("[+] connected to VPS");
+      control.setNoDelay(true);
+      control.setKeepAlive(true, CONTROL_KEEPALIVE_DELAY_MS);
+      const authData = Buffer.from(`TUN1 ${TOKEN}`);
+      sendMessage(MSG_TYPE.AUTH_HELLO, 0, authData);
+    });
+
+    control.on("drain", onControlDrain);
+
+    const parse = createBinaryParser(handleServerMessage);
+    control.on("data", parse);
+
+    control.on("close", () => {
+      console.log("[-] control disconnected, retrying...");
+      controlAuthenticated = false;
+      stopHeartbeat();
+      closeAllSessions();
+      setTimeout(connectControl, 2000);
+    });
+
+    control.on("error", (err) => {
+      console.log(`[-] control socket error: ${err.message}`);
+    });
+  }
+
+  connectControl();
+  connectUdpControl();
+}
+
+// If an argument is passed, use it; otherwise use "client.json" in the current directory
+const CONFIG_PATH = process.argv[2]
+  ? path.resolve(process.cwd(), process.argv[2])
+  : path.join(__dirname, "client.json");
+
+
+// --- MAIN / CONFIGURATION LOADING ---
+if (!fs.existsSync(CONFIG_PATH)) {
+  const example = {
+    config: [{
+      vps: { socket: "IP:PORT", token: "YOUR_TOKEN_HERE" },
+      tcp: { enabled: true, socket: "127.0.0.1:7000" },
+      udp: { enabled: true, socket: "127.0.0.1:7000" },
+      http: { comment: "Detects HTTP to send to another socket. This can break some specific server-first games", enabled: false, socket: "127.0.0.1:8080" }
+    }]
+  };
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(example, null, 4));
+  console.log("Generated client.json. Configure it and restart.");
+  process.exit(0);
+}
+
+const { config } = JSON.parse(fs.readFileSync(CONFIG_PATH));
+config.forEach(c => {
+  const getSocketData = (str, context) => {
+    const parts = String(str).split(":");
+    if (parts.length !== 2) {
+      throw new Error(`[CONFIG ERROR] Invalid format in ${context}: "${str}". Expected "ip:port" (e.g. 127.0.0.1:8000)`);
+    }
+
+    const host = parts[0];
+    const port = parseInt(parts[1]);
+
+    if (isNaN(port)) {
+      throw new Error(`[CONFIG ERROR] Port in ${context} ("${parts[1]}") is not a valid number.`);
+    }
+
+    return { host, port };
+  };
+
+  const vpsData = getSocketData(c.vps.socket, "VPS SOCKET");
+  const tcpData = getSocketData(c.tcp.socket, "TCP SOCKET");
+  const udpData = getSocketData(c.udp.socket, "UDP SOCKET");
+  const httpData = getSocketData(c.http.socket, "HTTP SOCKET");
+
+  console.log(`Configuring instance: ${c.vps.socket}`);
+  console.log(`>> TCP: ${c.tcp.enabled} ${c.tcp.socket}`);
+  console.log(`>> UDP: ${c.udp.enabled} ${c.udp.socket}`);
+  console.log(`>> HTTP: ${c.http.enabled} ${c.http.socket}`);
+
+  StartTunnel(c.vps.socket, c.vps.token, vpsData.host, vpsData.port, tcpData.host, tcpData.port, udpData.host, udpData.port, c.http.enabled, httpData.host, httpData.port)
+});
+
+setTimeout(() => {
+  setInterval(() => {
+    console.clear();
+  }, 5000);
+}, 4900);
