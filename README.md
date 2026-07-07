@@ -17,7 +17,7 @@ Follow these steps in order. You do not need to clone the repository; just downl
 
 ### 1. Get the files
 
-Download `server.js` and `client.js` directly from the [releases](----------------------------------------) section.  
+Download `server.js` and `client.js` directly from the [releases](https://github.com/Bertogim/nodejs-tcp-udp-tunnel/releases) section.  
 
 ---
 
