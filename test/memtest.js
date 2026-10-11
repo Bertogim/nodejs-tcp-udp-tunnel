@@ -78,7 +78,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   }));
 
   const origin = await startOrigin(originPort);
-  const server = spawn(process.execPath, ['server.js'], { cwd: tmp, env: { ...process.env, SERVER_PORT: String(serverPort) } });
+  const server = spawn(process.execPath, ['server.js'], { cwd: tmp, env: { ...process.env, SERVER_PORT: String(serverPort), CONN_RATE_LIMIT_PER_IP: '1000000' } });
   const client = spawn(process.execPath, ['client.js'], { cwd: tmp });
 
   const result = { N, samples: [] };

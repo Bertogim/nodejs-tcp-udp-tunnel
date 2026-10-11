@@ -180,10 +180,33 @@ Individual suites:
 npm run test:e2e          # slow-client isolation + stream integrity + UDP round-trip
 npm run test:regression   # asserts the old v1.0.0 server FAILS the isolation check
 npm run test:uplink       # upstream (client -> origin) byte-exact echo
+npm run test:udp          # steady-state UDP flow is not throttled (game-style burst)
 npm run test:mem          # asserts server RSS stays bounded under 100 slow clients
+npm run test:auth         # wrong token is rejected; incomplete handshake times out; logs throttled
+npm run test:ratelimit    # per-IP connection rate limit drops excess connections
 ```
 
 The `test:regression` suite is the sensitivity check: it runs the pre-optimization `v1.0.0` server and expects it to stall a fast client while another client is paused. If that ever stops failing, the isolation guarantee has regressed.
+
+---
+
+## Security
+
+### What is protected
+
+- **Strong token**: 64 random bytes (`crypto.randomBytes(64)`, 1024 bits), stored in `token` with `0600` permissions. The comparison uses `crypto.timingSafeEqual` (constant time).
+- **A failed/forged auth cannot hijack the worker**: the live worker reference is only replaced *after* a successful token check; a bad handshake only drops the attacker's own socket. A second connection presenting a valid token while a worker is already connected is rejected.
+- **Auth deadline**: an unauthenticated TCP connection that looks like a worker handshake is closed after `AUTH_TIMEOUT_MS` (default 2 s), so a fake candidate cannot hold a socket or buffer.
+- **Bounded pre-auth parsing**: handshake payloads are capped (`MAX_AUTH_DATA`, 4 KB).
+- **Per-IP rate limiting** on TCP connections, plus a hard `MAX_CONNECTIONS` cap, so a connection flood cannot exhaust file descriptors/RAM. UDP limits only the rate of **new** endpoints per IP; established flows (e.g. game traffic) are never throttled.
+- **Bounded bookkeeping**: `udpClients`, `sessionIPs` and `recentConnections` have hard caps, and repeated failure logs are throttled per IP.
+
+### What is NOT protected (threat model)
+
+- **No transport encryption.** The control connection is plain TCP and the token travels in the clear inside `AUTH_HELLO`. An on-path/MITM attacker can steal the token and impersonate the worker. Run the tunnel only over a trusted network, or front it with TLS/SSH (this is the main open item).
+- **UDP is unauthenticated per datagram** and cannot be encrypted by this design; source addresses are spoofable, so UDP tunnels can be abused as relays/amplifiers.
+- **The public port is an open relay by design.** Anyone who can reach it gets their TCP connection forwarded to your local service. Security of that service (SSH keys, game auth, etc.) is what actually protects it.
+- Limits are **soft** protections for availability, not confidentiality.
 
 ---
 
@@ -196,6 +219,13 @@ The `test:regression` suite is the sensitivity check: it runs the pre-optimizati
 | `CLIENT_SOCKET_HIGH_WATERMARK` | Write buffer threshold (bytes) for public client sockets before backpressure kicks in | `262144` (256 KB) |
 | `MAX_PER_SESSION_QUEUE` | Max queued bytes for a single slow client before its session is force‑closed | `4194304` (4 MB) |
 | `GLOBAL_QUEUE_BUDGET` | Max total queued bytes across all slow clients before sessions are force‑closed | `67108864` (64 MB) |
+| `AUTH_TIMEOUT_MS` | Max time an unauthenticated worker candidate may hold its socket | `2000` |
+| `MAX_CONNECTIONS` | Hard cap on concurrent TCP connections | `4096` |
+| `CONN_RATE_LIMIT_PER_IP` | Max new TCP connections per IP per second | `50` |
+| `UDP_NEW_CLIENT_RATE_LIMIT_PER_IP` | Max **new** UDP client endpoints per IP per second (does not limit steady-state packet flow) | `50` |
+| `LOG_FAIL_THROTTLE_MS` | Minimum interval between failure logs for the same IP | `10000` |
+| `MAX_UDP_CLIENTS` | Hard cap on tracked UDP client endpoints | `10000` |
+| `MAX_SESSION_IPS` | Hard cap on tracked session/recent IPs | `100000` |
 
 ---
 

@@ -106,6 +106,19 @@ async function main() {
   const WORKER_UDP_AUTH_PREFIX = "TUN1UDP";
   const CONSOLE_ACTIVITY_TIMEOUT_MS = 60 * 1000;
 
+  // --- Security limits (all env-tunable) ---
+  const AUTH_TIMEOUT_MS = parseInt(process.env.AUTH_TIMEOUT_MS || '2000', 10);
+  const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || '4096', 10);
+  const CONN_RATE_LIMIT_PER_IP = parseInt(process.env.CONN_RATE_LIMIT_PER_IP || '50', 10);
+  const UDP_NEW_CLIENT_RATE_LIMIT_PER_IP = parseInt(process.env.UDP_NEW_CLIENT_RATE_LIMIT_PER_IP || '50', 10);
+  const CONN_RATE_WINDOW_MS = 1000;
+  const LOG_FAIL_THROTTLE_MS = parseInt(process.env.LOG_FAIL_THROTTLE_MS || '10000', 10);
+  const MAX_UDP_CLIENTS = parseInt(process.env.MAX_UDP_CLIENTS || '10000', 10);
+  const MAX_SESSION_IPS = parseInt(process.env.MAX_SESSION_IPS || '100000', 10);
+  const MAX_AUTH_DATA = 4096; // auth payloads are tiny (TUN1 <128-char token>); bounds parser growth
+  const TCP_AUTH_PAYLOAD = `TUN1 ${TOKEN}`;
+  const UDP_AUTH_PAYLOAD = `${WORKER_UDP_AUTH_PREFIX} ${TOKEN}`;
+
   let worker = null;
   let workerUdpEndpoint = null;
   let workerConnected = false;
@@ -118,6 +131,10 @@ async function main() {
 
   let recentConnections = new Map();
   let sessionIPs = new Set();
+
+  const tcpRateLimit = new Map();   // ip -> { count, windowStart }
+  const udpRateLimit = new Map();   // ip -> { count, windowStart }
+  const authFailLogAt = new Map();  // ip -> last log timestamp
 
   // --- Stats loop (IPs only, no numbers) ---
   setInterval(() => {
@@ -154,7 +171,7 @@ async function main() {
     consoleOnly('Recent (5min):', Array.from(recentIPs).sort().join(' '));
     consoleOnly(' ');
     consoleOnly('Sessions:', Array.from(sessionIPs).sort().join(' '));
-    if (sessionIPs.size > 100000) sessionIPs.clear();
+    if (sessionIPs.size > MAX_SESSION_IPS) sessionIPs.clear();
   }, 5000);
 
   const UDP_TIMEOUT = 60 * 1000;
@@ -166,9 +183,47 @@ async function main() {
     for (const [ip, seenAt] of recentConnections) {
       if (now - seenAt > RECENT_CONNECTIONS_TTL_MS) recentConnections.delete(ip);
     }
+    for (const map of [tcpRateLimit, udpRateLimit]) {
+      for (const [ip, entry] of map) {
+        if (now - entry.windowStart > CONN_RATE_WINDOW_MS) map.delete(ip);
+      }
+    }
+    for (const [ip, t] of authFailLogAt) {
+      if (now - t > LOG_FAIL_THROTTLE_MS) authFailLogAt.delete(ip);
+    }
   }, 10000);
 
   // --- Helper functions ---
+  // Constant-time string compare for secrets (token). Falls back to false on
+  // length mismatch; token length is public/fixed so this leaks nothing useful.
+  function safeEqual(a, b) {
+    const ab = Buffer.from(a, 'utf8');
+    const bb = Buffer.from(b, 'utf8');
+    if (ab.length !== bb.length) return false;
+    return crypto.timingSafeEqual(ab, bb);
+  }
+
+  // Fixed-window per-IP rate limiter. Returns false when the limit is exceeded.
+  function allowRate(map, ip, limit) {
+    const now = Date.now();
+    let entry = map.get(ip);
+    if (!entry || now - entry.windowStart >= CONN_RATE_WINDOW_MS) {
+      entry = { count: 0, windowStart: now };
+      map.set(ip, entry);
+    }
+    entry.count++;
+    return entry.count <= limit;
+  }
+
+  // Throttle repeated failure logs per IP so a flood cannot fill the disk/CPU.
+  function logThrottled(ip, message) {
+    const now = Date.now();
+    if (now - (authFailLogAt.get(ip) || 0) >= LOG_FAIL_THROTTLE_MS) {
+      authFailLogAt.set(ip, now);
+      console.log(message);
+    }
+  }
+
   function getPort() {
     if (process.env.SERVER_PORT) return parseInt(process.env.SERVER_PORT, 10);
     if (process.env.PORT) return parseInt(process.env.PORT, 10);
@@ -293,12 +348,11 @@ async function main() {
   function isWorkerAuthHello(packet) {
     if (packet.length < 13 || packet[4] !== MSG_TYPE.AUTH_HELLO) return false;
     const totalLen = packet.readUInt32BE(0);
-    if (totalLen !== packet.length || totalLen > 1024 * 1024) return false;
+    if (totalLen !== packet.length || totalLen > MAX_AUTH_DATA) return false;
     const dataLen = packet.readUInt32BE(9);
     if (13 + dataLen !== totalLen) return false;
-    const expectedPrefix = `${WORKER_UDP_AUTH_PREFIX} ${TOKEN}`;
-    if (packet.length < 13 + expectedPrefix.length) return false;
-    return packet.toString('utf8', 13, 13 + expectedPrefix.length) === expectedPrefix;
+    if (packet.length < 13 + UDP_AUTH_PAYLOAD.length) return false;
+    return safeEqual(packet.toString('utf8', 13, 13 + UDP_AUTH_PAYLOAD.length), UDP_AUTH_PAYLOAD);
   }
 
   // Writes a frame without copying the payload: a 13-byte header plus the
@@ -415,30 +469,44 @@ async function main() {
   function handleWorkerConnection(sock, firstChunk) {
     let authenticated = false;
     const clientAddr = sock.remoteAddress + ':' + sock.remotePort;
+    const clientIp = sock.remoteAddress;
     stats.connections++;
+
+    // An unauthenticated "worker candidate" must not hold the socket (and its
+    // parser buffer) indefinitely. Drop it if auth does not complete in time.
+    const authTimer = setTimeout(() => {
+      if (authenticated) return;
+      stats.errors++;
+      logThrottled(clientIp, `[-] ${clientAddr}: auth timeout`);
+      sock.destroy();
+    }, AUTH_TIMEOUT_MS);
+    sock.once('close', () => clearTimeout(authTimer));
+    sock.once('error', () => clearTimeout(authTimer));
 
     const parse = createBinaryParser((msg) => {
       if (!authenticated) {
         if (msg.type !== MSG_TYPE.AUTH_HELLO) {
-          console.log(`[-] ${clientAddr}: expected AUTH_HELLO, got ${msg.type}`);
           stats.errors++;
+          logThrottled(clientIp, `[-] ${clientAddr}: expected AUTH_HELLO, got ${msg.type}`);
+          clearTimeout(authTimer);
           sock.destroy();
           return;
         }
         const authData = msg.data ? msg.data.toString() : "";
-        const parts = authData.split(" ");
-        if (parts[0] !== "TUN1" || parts[1] !== TOKEN) {
-          console.log(`[-] ${clientAddr}: auth failed`);
+        if (!safeEqual(authData, TCP_AUTH_PAYLOAD)) {
           stats.errors++;
+          logThrottled(clientIp, `[-] ${clientAddr}: auth failed`);
+          clearTimeout(authTimer);
           sock.destroy();
           return;
         }
         authenticated = true;
+        clearTimeout(authTimer);
 
         // Reject if a worker is already connected
         if (workerConnected) {
-          console.log(`[-] ${clientAddr}: Worker already connected, rejecting new connection`);
           stats.errors++;
+          logThrottled(clientIp, `[-] ${clientAddr}: Worker already connected, rejecting new connection`);
           sock.destroy();
           return;
         }
@@ -512,9 +580,9 @@ async function main() {
     const clientAddr = sock.remoteAddress + ':' + sock.remotePort;
     const sid = nextSid++;
     stats.connections++;
-    recentConnections.set(sock.remoteAddress, Date.now());
+    if (recentConnections.size < MAX_SESSION_IPS) recentConnections.set(sock.remoteAddress, Date.now());
     sock.lastActivityAt = Date.now();
-    sessionIPs.add(sock.remoteAddress);
+    if (sessionIPs.size < MAX_SESSION_IPS) sessionIPs.add(sock.remoteAddress);
 
     const session = {
       socket: sock,
@@ -597,13 +665,13 @@ async function main() {
   function isWorkerHandshakeChunk(chunk) {
     if (chunk.length < 13) return false;
     const msgLen = chunk.readUInt32BE(0);
-    if (msgLen < 13 || msgLen > 1024 * 1024) return false;
+    if (msgLen < 13 || msgLen > MAX_AUTH_DATA) return false;
     if (chunk[4] !== MSG_TYPE.AUTH_HELLO) return false;
     const dataLen = chunk.readUInt32BE(9);
-    if (dataLen < 0 || 13 + dataLen > 1024 * 1024) return false;
-    if (chunk.length < 13 + dataLen) return true;
-    const authData = chunk.slice(13, 13 + dataLen).toString();
-    return authData.startsWith(`TUN1 ${TOKEN}`);
+    if (dataLen < 0 || dataLen > MAX_AUTH_DATA) return false;
+    if (chunk.length < 13 + dataLen) return true; // partial AUTH_HELLO, keep reading
+    if (dataLen < TCP_AUTH_PAYLOAD.length) return false;
+    return safeEqual(chunk.slice(13, 13 + TCP_AUTH_PAYLOAD.length).toString(), TCP_AUTH_PAYLOAD);
   }
 
   // --- UDP from clients ---
@@ -611,6 +679,13 @@ async function main() {
     const srcKey = rinfo.address + ':' + rinfo.port;
     let entry = udpClients.get(srcKey);
     if (!entry) {
+      // Rate-limit only the creation of new UDP endpoints (memory churn), never
+      // the steady-state packet flow of an established player/session.
+      if (udpClients.size >= MAX_UDP_CLIENTS) return;
+      if (!allowRate(udpRateLimit, rinfo.address, UDP_NEW_CLIENT_RATE_LIMIT_PER_IP)) {
+        stats.errors++;
+        return;
+      }
       entry = { address: rinfo.address, port: rinfo.port, lastSeen: 0 };
       udpClients.set(srcKey, entry);
     }
@@ -655,6 +730,13 @@ async function main() {
     highWaterMark: CLIENT_SOCKET_HIGH_WATERMARK,
     pauseOnConnect: false
   }, (sock) => {
+    if (!allowRate(tcpRateLimit, sock.remoteAddress, CONN_RATE_LIMIT_PER_IP)) {
+      stats.errors++;
+      logThrottled(sock.remoteAddress, `[-] ${sock.remoteAddress}: TCP connection rate limit exceeded`);
+      sock.on('error', () => {});
+      sock.destroy();
+      return;
+    }
     sock.setNoDelay(true);
     sock.setKeepAlive(true, CONTROL_KEEPALIVE_DELAY_MS);
 
@@ -685,6 +767,8 @@ async function main() {
       clearTimeout(handshakeTimer);
     });
   });
+
+  tcpServer.maxConnections = MAX_CONNECTIONS;
 
   const udpServer = dgram.createSocket("udp4");
 
