@@ -128,6 +128,7 @@ Each message has the format:
 
 Message types include:
 - `TCP_OPEN`, `TCP_DATA`, `TCP_CLOSE`
+- `TCP_PAUSE`, `TCP_RESUME` (per-session flow control)
 - `UDP_IN`, `UDP_OUT`
 - `AUTH_HELLO`, `AUTH_OK`, `AUTH_FAIL`
 - `HEARTBEAT_PING`, `HEARTBEAT_PONG`
@@ -137,10 +138,11 @@ Authentication is performed by sending `TUN1 <token>` inside an `AUTH_HELLO` mes
 ### Flow Control and Memory Management
 
 - The parser buffer is capped at 1 MB to prevent memory exhaustion.
-- Each TCP session has a queue limit of 4 MB; if exceeded, the session is force‑closed.
-- Global backpressure: if the client's local sockets cannot keep up, the server pauses reading from the client.
-- The client also pauses reading from local sockets when its control connection's write buffer is full.
-- These mechanisms ensure stability under heavy load.
+- Each TCP session has a queue limit of 4 MB (`MAX_PER_SESSION_QUEUE`); if exceeded, the session is force‑closed.
+- A global buffer budget of 64 MB (`GLOBAL_QUEUE_BUDGET`) caps the total memory used by slow clients across all sessions.
+- Per‑session backpressure: when a single client's connection cannot keep up, the server pauses *only that session* (via `TCP_PAUSE`/`TCP_RESUME`) instead of stalling the whole worker.
+- Uplink backpressure: if the worker control socket is congested, the server pauses reading from the affected public socket until it drains.
+- The client also pauses reading from local sockets when its control connection's write buffer is full. These mechanisms ensure stability under heavy load.
 
 ---
 
@@ -163,12 +165,37 @@ These statistics are console‑only and are not written to log files.
 
 ---
 
+## Testing
+
+The test suite spins up a real `server.js` + `client.js` + local origin service on loopback ports and checks behaviour end to end. It needs `git` (used to fetch the `v1.0.0` baseline for the regression test) and is Linux/macOS only (memory/CPU sampling reads `/proc`). No dev dependencies are required.
+
+```bash
+npm test        # correctness suite: isolation, integrity, uplink, bounded memory
+npm run bench   # throughput + CPU benchmark (tune with N_READERS, DURATION_MS)
+```
+
+Individual suites:
+
+```bash
+npm run test:e2e          # slow-client isolation + stream integrity + UDP round-trip
+npm run test:regression   # asserts the old v1.0.0 server FAILS the isolation check
+npm run test:uplink       # upstream (client -> origin) byte-exact echo
+npm run test:mem          # asserts server RSS stays bounded under 100 slow clients
+```
+
+The `test:regression` suite is the sensitivity check: it runs the pre-optimization `v1.0.0` server and expects it to stall a fast client while another client is paused. If that ever stops failing, the isolation guarantee has regressed.
+
+---
+
 ## Environment Variables (Server)
 
 | Variable       | Description                           | Default |
 |----------------|---------------------------------------|---------|
 | `SERVER_PORT`  | Port the server listens on            | (prompt) |
 | `PORT`         | Alternative environment variable for port | (prompt) |
+| `CLIENT_SOCKET_HIGH_WATERMARK` | Write buffer threshold (bytes) for public client sockets before backpressure kicks in | `262144` (256 KB) |
+| `MAX_PER_SESSION_QUEUE` | Max queued bytes for a single slow client before its session is force‑closed | `4194304` (4 MB) |
+| `GLOBAL_QUEUE_BUDGET` | Max total queued bytes across all slow clients before sessions are force‑closed | `67108864` (64 MB) |
 
 ---
 
@@ -179,14 +206,14 @@ These statistics are console‑only and are not written to log files.
 | Connection refused | Server not running or firewall blocking port | Start the server; allow TCP and UDP on the port in the firewall. |
 | Authentication failed | Token mismatch | Copy the exact token from the server's `token` file to `client.json`. |
 | UDP not working | UDP port blocked or client UDP socket not connected | Ensure both TCP and UDP are open on the hosting firewall. Check client logs for UDP errors. |
-| High memory usage | Queue limits exceeded | Reduce traffic or increase `MAX_PER_SESSION_QUEUE` (server) / adjust limits in the code. |
+| High memory usage | Too many slow clients buffering data | Lower `GLOBAL_QUEUE_BUDGET` or `MAX_PER_SESSION_QUEUE` (env vars on the server). |
 | Client disconnects repeatedly | Heartbeat timeout | Check network stability; increase `HEARTBEAT_TIMEOUT_MS` in the code if needed. |
 
 ---
 
 ## License
 
-MIT, free to use, modify, and distribute.
+This project is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later). See the [LICENSE](LICENSE) file for the full text. You are free to use, modify, and redistribute it under the terms of that license.
 
 ---
 

@@ -90,8 +90,11 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
   const pausedLocalSockets = new Set();
 
   function onControlDrain() {
-    for (const sock of pausedLocalSockets) {
-      sock.resume();
+    for (const s of tcpSessions.values()) {
+      const sock = s.socket;
+      if (sock && !sock.destroyed && pausedLocalSockets.has(sock) && !s.remotePaused) {
+        sock.resume();
+      }
     }
     pausedLocalSockets.clear();
   }
@@ -314,6 +317,7 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
 
     sock.on("connect", () => {
       s.ready = true;
+      if (s.remotePaused) sock.pause();
       console.log(`[*] local TCP session ${sid} connected to ${s.host}:${s.port}`);
       for (const chunk of s.pending) sock.write(chunk);
       s.pending = [];
@@ -428,6 +432,7 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
       host: LOCAL_TCP_HOST,
       writeBlocked: false,
       _drainListenerAttached: false,
+      remotePaused: false,
     };
 
     tcpSessions.set(String(sid), state);
@@ -442,6 +447,7 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
 
     sock.on("connect", () => {
       state.ready = true;
+      if (state.remotePaused) sock.pause();
       console.log(`[*] local TCP session ${sid} connected to ${state.host}:${state.port}`);
       for (const chunk of state.pending) sock.write(chunk);
       state.pending = [];
@@ -542,6 +548,7 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
       // Pause/resume: the server may send them, but we handle carefully
       if (type === MSG_TYPE.TCP_PAUSE) {
         const s = tcpSessions.get(String(sid));
+        if (s) s.remotePaused = true;
         if (s && s.socket && !s.socket.destroyed) {
           s.socket.pause();
           console.log(`[*] Session ${sid} paused (received from server)`);
@@ -551,7 +558,8 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
 
       if (type === MSG_TYPE.TCP_RESUME) {
         const s = tcpSessions.get(String(sid));
-        if (s && s.socket && !s.socket.destroyed) {
+        if (s) s.remotePaused = false;
+        if (s && s.socket && !s.socket.destroyed && !pausedLocalSockets.has(s.socket)) {
           s.socket.resume();
           console.log(`[*] Session ${sid} resumed (received from server)`);
         }

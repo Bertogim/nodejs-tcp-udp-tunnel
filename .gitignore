@@ -1,0 +1,6 @@
+node_modules/
+token
+server-logs/
+worker-logs/
+*.log
+*-v8.log

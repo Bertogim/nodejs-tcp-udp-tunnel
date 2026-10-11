@@ -80,8 +80,10 @@ async function main() {
   const BUFFER_SIZE = 256 * 1024;
   const MAX_PARSER_BUFFER = 1024 * 1024;      // 1 MB max parser buffer size
   const WORKER_HANDSHAKE_TIMEOUT_MS = 250;
-  const CLIENT_SOCKET_HIGH_WATERMARK = 1024 * 1024;
-  const MAX_PER_SESSION_QUEUE = 4 * 1024 * 1024;    // 4 MB max queue per session
+  const CLIENT_SOCKET_HIGH_WATERMARK = parseInt(process.env.CLIENT_SOCKET_HIGH_WATERMARK || String(256 * 1024), 10);
+  const MAX_PER_SESSION_QUEUE = parseInt(process.env.MAX_PER_SESSION_QUEUE || String(4 * 1024 * 1024), 10);   // per-session slow-client cap
+  const GLOBAL_QUEUE_BUDGET = parseInt(process.env.GLOBAL_QUEUE_BUDGET || String(64 * 1024 * 1024), 10);       // total slow-client buffering cap
+  const RECENT_CONNECTIONS_TTL_MS = 5 * 60 * 1000;
 
   const MSG_TYPE = {
     TCP_OPEN: 0x01,
@@ -94,6 +96,8 @@ async function main() {
     AUTH_FAIL: 0x12,
     HEARTBEAT_PING: 0x20,
     HEARTBEAT_PONG: 0x21,
+    TCP_PAUSE: 0x30,
+    TCP_RESUME: 0x31,
   };
 
   const CONTROL_KEEPALIVE_DELAY_MS = 30_000;
@@ -105,12 +109,12 @@ async function main() {
   let worker = null;
   let workerUdpEndpoint = null;
   let workerConnected = false;
-  let workerPausedGlobally = false;
 
   const tcpSessions = new Map();
   const udpClients = new Map();
   let nextSid = 1;
   let stats = { connections: 0, errors: 0 };
+  let totalQueuedBytes = 0;
 
   let recentConnections = new Map();
   let sessionIPs = new Set();
@@ -143,7 +147,7 @@ async function main() {
 
     consoleOnly('Worker TCP:', workerConnected ? 'YES' : 'NO');
     consoleOnly('Worker UDP:', workerUdpEndpoint ? 'YES' : 'NO');
-    consoleOnly('Worker Paused:', workerPausedGlobally ? 'YES' : 'NO');
+    consoleOnly('Paused TCP sessions:', Array.from(tcpSessions.values()).filter(session => session.paused).length);
     consoleOnly(' ');
     consoleOnly('Connected:', Array.from(active).sort().join(' '));
     consoleOnly(' ');
@@ -158,6 +162,9 @@ async function main() {
     const now = Date.now();
     for (const [key, client] of udpClients.entries()) {
       if (now - client.lastSeen > UDP_TIMEOUT) udpClients.delete(key);
+    }
+    for (const [ip, seenAt] of recentConnections) {
+      if (now - seenAt > RECENT_CONNECTIONS_TTL_MS) recentConnections.delete(ip);
     }
   }, 10000);
 
@@ -185,6 +192,15 @@ async function main() {
         }
       });
     });
+  }
+
+  function encodeHeader(type, sid, dataLen) {
+    const buf = Buffer.allocUnsafe(13);
+    buf.writeUInt32BE(13 + dataLen, 0);
+    buf.writeUInt8(type, 4);
+    buf.writeUInt32BE(sid, 5);
+    buf.writeUInt32BE(dataLen, 9);
+    return buf;
   }
 
   function encodeMessage(type, sid, data) {
@@ -285,11 +301,18 @@ async function main() {
     return packet.toString('utf8', 13, 13 + expectedPrefix.length) === expectedPrefix;
   }
 
+  // Writes a frame without copying the payload: a 13-byte header plus the
+  // caller's buffer are corked together so the OS sees a single writev.
   function sendToWorker(type, sid, data) {
     if (!worker || worker.destroyed || !workerConnected) return false;
-    const msg = encodeMessage(type, sid, data);
-    worker.write(msg);
-    return true;
+    const dataLen = data ? data.length : 0;
+    const header = encodeHeader(type, sid, dataLen);
+    if (dataLen === 0) return worker.write(header);
+    worker.cork();
+    const wroteHeader = worker.write(header);
+    const wroteData = worker.write(data);
+    worker.uncork();
+    return wroteHeader && wroteData;
   }
 
   // --- Worker message handling ---
@@ -323,10 +346,15 @@ async function main() {
         if (session.paused) {
           session.queue.push(data);
           session.queueSize += data.length;
+          totalQueuedBytes += data.length;
 
-          // If queue limit exceeded, force close the session
-          if (session.queueSize > MAX_PER_SESSION_QUEUE) {
+          // Force close when this session, or all sessions together, exceed
+          // the buffering budget (protects the server's memory).
+          if (session.queueSize > MAX_PER_SESSION_QUEUE || totalQueuedBytes > GLOBAL_QUEUE_BUDGET) {
             console.log(`[-] Session ${sid}: queue overflow, closing`);
+            totalQueuedBytes -= session.queueSize;
+            session.queue = [];
+            session.queueSize = 0;
             sock.destroy();
             tcpSessions.delete(String(sid));
             sendToWorker(MSG_TYPE.TCP_CLOSE, sid, null);
@@ -341,12 +369,8 @@ async function main() {
           // The socket's internal buffer is full, pause the session
           session.paused = true;
 
-          // Pause reading from the worker so it stops sending data
-          if (!workerPausedGlobally && worker && !worker.destroyed) {
-            worker.pause();
-            workerPausedGlobally = true;
-            //console.log(`[*] Pausing worker due to session ${sid} backpressure`);
-          }
+          // Stop only this session's producer, keeping the tunnel readable.
+          sendToWorker(MSG_TYPE.TCP_PAUSE, sid, null);
         }
         return;
       }
@@ -359,11 +383,11 @@ async function main() {
             session.socket.destroy();
           }
           // Clear queue and state
+          totalQueuedBytes -= session.queueSize;
           session.queue = [];
           session.queueSize = 0;
           session.paused = false;
-          // If this session was the only paused one, resume worker if needed
-          checkAndResumeWorker();
+          session.workerBlocked = false;
         }
         tcpSessions.delete(String(sid));
         return;
@@ -384,23 +408,6 @@ async function main() {
       }
     } catch (e) {
       console.log("[-] error in handleWorkerMessage:", e.message);
-    }
-  }
-
-  // Check if all sessions are unpaused and resume the worker
-  function checkAndResumeWorker() {
-    if (!workerPausedGlobally) return;
-    let anyPaused = false;
-    for (const session of tcpSessions.values()) {
-      if (session.paused) {
-        anyPaused = true;
-        break;
-      }
-    }
-    if (!anyPaused && worker && !worker.destroyed) {
-      worker.resume();
-      workerPausedGlobally = false;
-      //console.log(`[*] Resuming worker, all sessions writable`);
     }
   }
 
@@ -451,11 +458,22 @@ async function main() {
         worker.write(encodeMessage(MSG_TYPE.AUTH_OK, 0, null));
         workerConnected = true;
 
+        // When the worker's write buffer drains, resume clients we paused.
+        worker.on("drain", () => {
+          for (const session of tcpSessions.values()) {
+            if (!session.workerBlocked) continue;
+            session.workerBlocked = false;
+            const sockClient = session.socket;
+            if (sockClient && !sockClient.destroyed && sockClient.isPaused()) sockClient.resume();
+          }
+        });
+
         // Resume TCP sessions that were paused due to lack of worker
         for (const [sid, session] of tcpSessions) {
           const sockClient = session.socket;
           if (sockClient && !sockClient.destroyed) {
             sendToWorker(MSG_TYPE.TCP_OPEN, Number(sid), null);
+            if (session.paused) sendToWorker(MSG_TYPE.TCP_PAUSE, Number(sid), null);
             sockClient.resume();
           }
         }
@@ -464,9 +482,9 @@ async function main() {
           if (worker === sock) {
             worker = null;
             workerConnected = false;
-            workerPausedGlobally = false;
             console.log(`[-] Worker disconnected: ${clientAddr}`);
             for (const session of tcpSessions.values()) {
+              session.workerBlocked = false;
               const sockClient = session.socket;
               if (sockClient && !sockClient.destroyed) sockClient.pause();
             }
@@ -503,26 +521,26 @@ async function main() {
       queue: [],
       queueSize: 0,
       paused: false,
+      workerBlocked: false,
     };
 
     // 'drain' event handler to resume data sending
     session.onDrain = () => {
-      if (!session.paused) return;
+      if (!session.paused || sock.destroyed) return;
       // Try to send all queued data
       while (session.queue.length > 0) {
-        const chunk = session.queue[0];
-        if (sock.write(chunk) === false) {
-          // It's full again, break out of loop
-          break;
-        }
-        // Written successfully, remove from queue
-        session.queue.shift();
+        const chunk = session.queue.shift();
         session.queueSize -= chunk.length;
+        totalQueuedBytes -= chunk.length;
+        // write(false) still accepts the chunk; never enqueue it again.
+        if (sock.write(chunk) === false) {
+          return;
+        }
       }
       // If the queue is empty, the session is no longer paused
       if (session.queue.length === 0) {
         session.paused = false;
-        checkAndResumeWorker();
+        sendToWorker(MSG_TYPE.TCP_RESUME, sid, null);
       }
     };
 
@@ -542,7 +560,12 @@ async function main() {
     sock.on("data", (chunk) => {
       if (worker && !worker.destroyed && workerConnected) {
         sock.lastActivityAt = Date.now();
-        sendToWorker(MSG_TYPE.TCP_DATA, sid, chunk);
+        // If the worker cannot keep up, stop reading from this client so the
+        // worker's write queue cannot grow without bound.
+        if (!sendToWorker(MSG_TYPE.TCP_DATA, sid, chunk) && !sock.isPaused()) {
+          session.workerBlocked = true;
+          sock.pause();
+        }
       } else {
         if (!sock.isPaused()) sock.pause();
       }
@@ -550,22 +573,24 @@ async function main() {
 
     sock.on("close", () => {
       sock.removeListener('drain', session.onDrain);
+      totalQueuedBytes -= session.queueSize;
       session.queue = [];
       session.queueSize = 0;
       session.paused = false;
+      session.workerBlocked = false;
       tcpSessions.delete(String(sid));
       if (workerConnected) sendToWorker(MSG_TYPE.TCP_CLOSE, sid, null);
-      checkAndResumeWorker(); // in case it was the last paused session
     });
 
     sock.on("error", (err) => {
       sock.removeListener('drain', session.onDrain);
+      totalQueuedBytes -= session.queueSize;
       session.queue = [];
       session.queueSize = 0;
       session.paused = false;
+      session.workerBlocked = false;
       tcpSessions.delete(String(sid));
       if (workerConnected) sendToWorker(MSG_TYPE.TCP_CLOSE, sid, null);
-      checkAndResumeWorker();
     });
   }
 
