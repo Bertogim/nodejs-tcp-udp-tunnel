@@ -24,30 +24,33 @@ Download `server.js` and `client.js` directly from the [releases](https://github
 ### 2. Server setup (on the public hosting)
 
 - Place `server.js` on the server.
-- Run it. If you do not specify a port via environment variables, you will be prompted to enter one.
+- Run it passing the port as an argument. If you omit the port, you will be prompted to enter one.
 
 ```bash
-node server.js
-```
-
-To set the port in advance:
-
-```bash
-PORT=8080 node server.js
-# or
-SERVER_PORT=8080 node server.js
+node server.js 8080
 ```
 
 - On first start, the server creates a `token` file in its directory. This file contains a random 64‑byte hex string. **Copy this token**, you will need it for the client.
 
-- The server automatically creates a `server-logs/` folder and writes a new log file per run (timestamped).
+- The server automatically creates a `server-logs/` folder and writes a new log file per run (timestamped). See [Logging](#logging) to change the directory or disable it.
 
 ---
 
 ### 3. Client setup (on your local machine)
 
 - Place `client.js` on your local machine.
-- Create a configuration file named `client.json` in the same directory. If the client is run without it, it will generate an example configuration that you can edit.
+- Create a configuration file named `client.json` in the same directory. If the client is run without it, an interactive setup wizard will ask a few questions and write the file for you (when run in a terminal). If run without a terminal (e.g. as a service) and without a config, it writes a commented example instead.
+
+The wizard asks:
+
+```
+server socket (IP:port): 203.0.113.10:9000
+token: <the token from the server>
+mode: 1 tcp, 2 udp, 3 tcp+udp [3]:
+tcp socket (IP:port): 127.0.0.1:25565
+udp socket (IP:port) (Enter for same as TCP) [127.0.0.1:25565]:
+add http redirection to another socket? 1 no, 2 yes (Enter for no) [1]:
+```
 
 - The `client.json` file must have this structure:
 
@@ -96,7 +99,7 @@ If your config is in another location:
 node client.js /path/to/your/config.json
 ```
 
-- The client creates a `worker-logs/` folder and writes a new log file per run.
+- The client creates a `worker-logs/` folder and writes a new log file per run. See [Logging](#logging) to change the directory or disable it.
 
 ---
 
@@ -156,12 +159,35 @@ Authentication is performed by sending `TUN1 <token>` inside an `AUTH_HELLO` mes
 
 ## Monitoring
 
-Both server and client print periodic statistics to the console every 5 seconds:
+Both server and client print periodic statistics to the console:
 
-- **Server**: worker TCP/UDP status, active IP addresses, recent IPs (last 5 minutes), active session IPs.
-- **Client**: worker TCP/UDP status, number of active TCP/UDP sessions.
+- **Server** (every 5 s): worker TCP/UDP status, paused TCP sessions, connected IP addresses, recent IPs (last 5 minutes), active session IPs.
+- **Client** (every 1 s): worker TCP/UDP status, number of active TCP/UDP sessions.
 
-These statistics are console‑only and are not written to log files.
+In a terminal the stats are shown as a **pinned status block** at the bottom while event logs scroll above it (colored, no full‑screen clears). When output is not a terminal (piped or run as a service) the client prints plain, greppable lines and stats are emitted only every 30 seconds. Statistics are console‑only and are not written to log files.
+
+---
+
+## Logging
+
+Both `server.js` and `client.js` write a timestamped log file per run (`server-logs/` and `worker-logs/` by default). Logging is optional and the directory is configurable.
+
+| Option | CLI flag | Environment variable |
+|--------|----------|----------------------|
+| Change the log directory | `--log-dir <path>` | `LOG_DIR=<path>` |
+| Disable file logging | `--no-log` | `NO_LOG=1` |
+
+Examples:
+
+```bash
+node server.js 8080 --log-dir /var/log/tunnel
+node server.js 8080 --no-log
+LOG_DIR=/var/log/tunnel node client.js
+NO_LOG=1 node client.js /path/to/config.json
+```
+
+- The log directory is created automatically if it does not exist.
+- When logging is disabled the program still prints everything to the console; only the file is skipped.
 
 ---
 
@@ -214,8 +240,8 @@ The `test:regression` suite is the sensitivity check: it runs the pre-optimizati
 
 | Variable       | Description                           | Default |
 |----------------|---------------------------------------|---------|
-| `SERVER_PORT`  | Port the server listens on            | (prompt) |
-| `PORT`         | Alternative environment variable for port | (prompt) |
+| `LOG_DIR`      | Directory for log files (also `--log-dir`) | `server-logs/` |
+| `NO_LOG`       | Set to `1` to disable file logging (also `--no-log`) | (enabled) |
 | `CLIENT_SOCKET_HIGH_WATERMARK` | Write buffer threshold (bytes) for public client sockets before backpressure kicks in | `262144` (256 KB) |
 | `MAX_PER_SESSION_QUEUE` | Max queued bytes for a single slow client before its session is force‑closed | `4194304` (4 MB) |
 | `GLOBAL_QUEUE_BUDGET` | Max total queued bytes across all slow clients before sessions are force‑closed | `67108864` (64 MB) |

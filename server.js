@@ -10,9 +10,25 @@ const path = require("path");
 const readline = require('readline');
 const crypto = require('crypto');
 
-// --- Logging ---
-const logsDir = path.join(__dirname, 'server-logs');
-if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+// --- CLI arguments ---
+// Usage: node server.js [port] [--log-dir <path>] [--no-log]
+function parseArgs(argv) {
+  const opts = { positional: [], logDir: null, noLog: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--no-log" || a === "--no-logs") opts.noLog = true;
+    else if (a === "--log-dir") opts.logDir = argv[++i] || null;
+    else if (a.startsWith("--log-dir=")) opts.logDir = a.slice("--log-dir=".length);
+    else opts.positional.push(a);
+  }
+  return opts;
+}
+const ARGS = parseArgs(process.argv.slice(2));
+
+// --- Logging (optional and configurable) ---
+// Disable with --no-log (or NO_LOG=1); change the directory with --log-dir <path> (or LOG_DIR).
+const NO_LOG = ARGS.noLog || /^(1|true|yes|on)$/i.test(process.env.NO_LOG || "");
+const LOG_DIR = ARGS.logDir || process.env.LOG_DIR || path.join(__dirname, "server-logs");
 
 const getLogFileName = () => {
   const now = new Date();
@@ -25,30 +41,107 @@ const getLogFileName = () => {
   return `${year}-${month}-${day}_${hours}-${minutes}-${seconds}.txt`;
 };
 
-let logFilePath = path.join(logsDir, getLogFileName());
-let logStream = fs.createWriteStream(logFilePath, { flags: "a" });
+let logFilePath = null;
+let logStream = null;
+
+const originalLog = console.log;
 
 function ensureLogStream() {
+  if (NO_LOG) return;
   if (logStream && !logStream.destroyed) return;
-  logFilePath = path.join(logsDir, getLogFileName());
+  if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+  logFilePath = path.join(LOG_DIR, getLogFileName());
   logStream = fs.createWriteStream(logFilePath, { flags: "a" });
   logStream.on("error", (err) => {
     originalLog.call(console, `[log-stream-error] ${err.message}`);
   });
 }
 
-const originalLog = console.log;
+// --- Pretty console UI (self-contained, no deps, TTY-aware, no flicker) ---
+// When stdout is a TTY we pin a small status block at the bottom and print
+// event logs above it using cursor movement (never a full console.clear()).
+// When it is not a TTY (service / piped to a file) we emit plain, greppable
+// lines and only dump stats every 30s so logs stay clean.
+const _out = process.stdout;
+const _isTTY = _out.isTTY === true;
+const _useColor = _isTTY && !process.env.NO_COLOR;
+const C = {
+  reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
+  red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m",
+  cyan: "\x1b[36m", gray: "\x1b[90m",
+};
+const paint = (code, s) => (_useColor ? code + s + C.reset : s);
+
+function fmtEvent(msg) {
+  if (!_useColor) return msg;
+  const time = paint(C.gray, new Date().toTimeString().slice(0, 8));
+  let body = msg;
+  if (msg.startsWith("[+] ")) body = paint(C.green, "[+]") + " " + msg.slice(4);
+  else if (msg.startsWith("[-] ")) body = paint(C.red, "[-]") + " " + msg.slice(4);
+  else if (msg.startsWith("[*] ")) body = paint(C.cyan, "[*]") + " " + msg.slice(4);
+  return time + " " + body;
+}
+
+const ui = (() => {
+  let drawn = 0;
+  let lastRows = [];
+  let lastNonTtyAt = 0;
+  const width = () => _out.columns || 100;
+
+  function clear() {
+    if (!_isTTY || drawn === 0) return;
+    _out.write("\x1b[1A\x1b[2K".repeat(drawn));
+    drawn = 0;
+  }
+  function drawRows(rows) {
+    const labelWidth = rows.reduce((m, [k]) => Math.max(m, k.length + 1), 0);
+    const lines = rows.map(([k, v]) => {
+      let val = String(v);
+      const room = Math.max(0, width() - labelWidth - 2);
+      if (val.length > room) val = val.slice(0, Math.max(0, room - 1)) + "…";
+      const label = paint(C.cyan, k + ":") + " ".repeat(labelWidth - (k.length + 1));
+      return label + " " + val;
+    });
+    _out.write(lines.join("\n") + "\n");
+    drawn = lines.length;
+  }
+  return {
+    log(msg) {
+      const line = fmtEvent(msg);
+      if (!_isTTY) { _out.write(line + "\n"); return; }
+      clear();
+      _out.write(line + "\n");
+      if (lastRows.length) drawRows(lastRows);
+    },
+    status(rows) {
+      lastRows = rows;
+      if (_isTTY) { clear(); drawRows(rows); return; }
+      const now = Date.now();
+      if (now - lastNonTtyAt < 30000) return;
+      lastNonTtyAt = now;
+      _out.write("[stats] " + rows.map(([k, v]) => `${k}=${v}`).join(" ") + "\n");
+    },
+    banner(title, subtitle) {
+      if (!_isTTY) return;
+      const bar = paint(C.cyan, "─".repeat(Math.min(width(), Math.max(24, title.length + 8))));
+      _out.write("\n" + bar + "\n");
+      _out.write(" " + paint(C.bold, title) + "\n");
+      if (subtitle) _out.write(" " + paint(C.gray, subtitle) + "\n");
+      _out.write(bar + "\n\n");
+    },
+    good(v) { return paint(C.green, v); },
+    bad(v) { return paint(C.red, v); },
+    dim(v) { return paint(C.gray, v); },
+  };
+})();
+
 console.log = function (...args) {
   const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
-  const timestamp = new Date().toISOString();
-  const logLine = `[${timestamp}] ${message}\n`;
-  ensureLogStream();
-  logStream.write(logLine);
-  originalLog.apply(console, args);
-};
-
-const consoleOnly = function (...args) {
-  originalLog.apply(console, args);
+  if (!NO_LOG) {
+    ensureLogStream();
+    logStream.write(`[${new Date().toISOString()}] ${message}\n`);
+  }
+  ui.log(message);
 };
 
 // --- Token handling ---
@@ -70,6 +163,8 @@ function getToken() {
 }
 
 async function main() {
+  ui.banner("nodejs-tcp-udp-tunnel", "server");
+  console.log(NO_LOG ? "[*] Logging disabled" : `[*] Logging to ${LOG_DIR}`);
   let detectedPort = getPort();
   if (!detectedPort) {
     detectedPort = await requestManualPort();
@@ -136,9 +231,14 @@ async function main() {
   const udpRateLimit = new Map();   // ip -> { count, windowStart }
   const authFailLogAt = new Map();  // ip -> last log timestamp
 
-  // --- Stats loop (IPs only, no numbers) ---
+  // --- Stats loop ---
+  const fmtList = (iterable) => {
+    const list = Array.from(iterable).sort();
+    const shown = list.slice(0, 30);
+    return shown.join(" ") + (list.length > shown.length ? ` +${list.length - shown.length}` : "");
+  };
+
   setInterval(() => {
-    console.clear();
     const now = Date.now();
     const active = new Set();
 
@@ -162,15 +262,16 @@ async function main() {
         .map(([ip]) => ip)
     );
 
-    consoleOnly('Worker TCP:', workerConnected ? 'YES' : 'NO');
-    consoleOnly('Worker UDP:', workerUdpEndpoint ? 'YES' : 'NO');
-    consoleOnly('Paused TCP sessions:', Array.from(tcpSessions.values()).filter(session => session.paused).length);
-    consoleOnly(' ');
-    consoleOnly('Connected:', Array.from(active).sort().join(' '));
-    consoleOnly(' ');
-    consoleOnly('Recent (5min):', Array.from(recentIPs).sort().join(' '));
-    consoleOnly(' ');
-    consoleOnly('Sessions:', Array.from(sessionIPs).sort().join(' '));
+    const paused = Array.from(tcpSessions.values()).filter(session => session.paused).length;
+
+    ui.status([
+      ["Worker TCP", workerConnected ? ui.good("YES") : ui.bad("NO")],
+      ["Worker UDP", workerUdpEndpoint ? ui.good("YES") : ui.bad("NO")],
+      ["Paused TCP", String(paused)],
+      ["Connected", fmtList(active)],
+      ["Recent 5min", fmtList(recentIPs)],
+      ["Sessions", fmtList(sessionIPs)],
+    ]);
     if (sessionIPs.size > MAX_SESSION_IPS) sessionIPs.clear();
   }, 5000);
 
@@ -225,6 +326,8 @@ async function main() {
   }
 
   function getPort() {
+    const argPort = parseInt(ARGS.positional[0], 10);
+    if (Number.isInteger(argPort) && argPort > 0 && argPort <= 65535) return argPort;
     if (process.env.SERVER_PORT) return parseInt(process.env.SERVER_PORT, 10);
     if (process.env.PORT) return parseInt(process.env.PORT, 10);
     return null;

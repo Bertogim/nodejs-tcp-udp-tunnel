@@ -7,10 +7,27 @@ const net = require("net");
 const dgram = require("dgram");
 const fs = require("fs");
 const path = require("path");
+const readline = require("readline");
 
-// Setup logging
-const logsDir = path.join(__dirname, 'worker-logs');
-if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+// --- CLI arguments ---
+// Usage: node client.js [config.json] [--log-dir <path>] [--no-log]
+function parseArgs(argv) {
+  const opts = { positional: [], logDir: null, noLog: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--no-log" || a === "--no-logs") opts.noLog = true;
+    else if (a === "--log-dir") opts.logDir = argv[++i] || null;
+    else if (a.startsWith("--log-dir=")) opts.logDir = a.slice("--log-dir=".length);
+    else opts.positional.push(a);
+  }
+  return opts;
+}
+const ARGS = parseArgs(process.argv.slice(2));
+
+// --- Logging (optional and configurable) ---
+// Disable with --no-log (or NO_LOG=1); change the directory with --log-dir <path> (or LOG_DIR).
+const NO_LOG = ARGS.noLog || /^(1|true|yes|on)$/i.test(process.env.NO_LOG || "");
+const LOG_DIR = ARGS.logDir || process.env.LOG_DIR || path.join(__dirname, "worker-logs");
 
 const getLogFileName = () => {
   const now = new Date();
@@ -23,30 +40,107 @@ const getLogFileName = () => {
   return `${year}-${month}-${day}_${hours}-${minutes}-${seconds}.txt`;
 };
 
-let logFilePath = path.join(logsDir, getLogFileName());
-let logStream = fs.createWriteStream(logFilePath, { flags: "a" });
+let logFilePath = null;
+let logStream = null;
+
+const originalLog = console.log;
 
 function ensureLogStream() {
+  if (NO_LOG) return;
   if (logStream && !logStream.destroyed) return;
-  logFilePath = path.join(logsDir, getLogFileName());
+  if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+  logFilePath = path.join(LOG_DIR, getLogFileName());
   logStream = fs.createWriteStream(logFilePath, { flags: "a" });
   logStream.on("error", (err) => {
     originalLog.call(console, `[log-stream-error] ${err.message}`);
   });
 }
 
-const originalLog = console.log;
+// --- Pretty console UI (self-contained, no deps, TTY-aware, no flicker) ---
+// When stdout is a TTY we pin a small status block at the bottom and print
+// event logs above it using cursor movement (never a full console.clear()).
+// When it is not a TTY (service / piped to a file) we emit plain, greppable
+// lines and only dump stats every 30s so logs stay clean.
+const _out = process.stdout;
+const _isTTY = _out.isTTY === true;
+const _useColor = _isTTY && !process.env.NO_COLOR;
+const C = {
+  reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
+  red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m",
+  cyan: "\x1b[36m", gray: "\x1b[90m",
+};
+const paint = (code, s) => (_useColor ? code + s + C.reset : s);
+
+function fmtEvent(msg) {
+  if (!_useColor) return msg;
+  const time = paint(C.gray, new Date().toTimeString().slice(0, 8));
+  let body = msg;
+  if (msg.startsWith("[+] ")) body = paint(C.green, "[+]") + " " + msg.slice(4);
+  else if (msg.startsWith("[-] ")) body = paint(C.red, "[-]") + " " + msg.slice(4);
+  else if (msg.startsWith("[*] ")) body = paint(C.cyan, "[*]") + " " + msg.slice(4);
+  return time + " " + body;
+}
+
+const ui = (() => {
+  let drawn = 0;
+  let lastRows = [];
+  let lastNonTtyAt = 0;
+  const width = () => _out.columns || 100;
+
+  function clear() {
+    if (!_isTTY || drawn === 0) return;
+    _out.write("\x1b[1A\x1b[2K".repeat(drawn));
+    drawn = 0;
+  }
+  function drawRows(rows) {
+    const labelWidth = rows.reduce((m, [k]) => Math.max(m, k.length + 1), 0);
+    const lines = rows.map(([k, v]) => {
+      let val = String(v);
+      const room = Math.max(0, width() - labelWidth - 2);
+      if (val.length > room) val = val.slice(0, Math.max(0, room - 1)) + "…";
+      const label = paint(C.cyan, k + ":") + " ".repeat(labelWidth - (k.length + 1));
+      return label + " " + val;
+    });
+    _out.write(lines.join("\n") + "\n");
+    drawn = lines.length;
+  }
+  return {
+    log(msg) {
+      const line = fmtEvent(msg);
+      if (!_isTTY) { _out.write(line + "\n"); return; }
+      clear();
+      _out.write(line + "\n");
+      if (lastRows.length) drawRows(lastRows);
+    },
+    status(rows) {
+      lastRows = rows;
+      if (_isTTY) { clear(); drawRows(rows); return; }
+      const now = Date.now();
+      if (now - lastNonTtyAt < 30000) return;
+      lastNonTtyAt = now;
+      _out.write("[stats] " + rows.map(([k, v]) => `${k}=${v}`).join(" ") + "\n");
+    },
+    banner(title, subtitle) {
+      if (!_isTTY) return;
+      const bar = paint(C.cyan, "─".repeat(Math.min(width(), Math.max(24, title.length + 8))));
+      _out.write("\n" + bar + "\n");
+      _out.write(" " + paint(C.bold, title) + "\n");
+      if (subtitle) _out.write(" " + paint(C.gray, subtitle) + "\n");
+      _out.write(bar + "\n\n");
+    },
+    good(v) { return paint(C.green, v); },
+    bad(v) { return paint(C.red, v); },
+    dim(v) { return paint(C.gray, v); },
+  };
+})();
+
 console.log = function (...args) {
   const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
-  const timestamp = new Date().toISOString();
-  const logLine = `[${timestamp}] ${message}\n`;
-  ensureLogStream();
-  logStream.write(logLine);
-  originalLog.apply(console, args);
-};
-
-const consoleOnly = function (...args) {
-  originalLog.apply(console, args);
+  if (!NO_LOG) {
+    ensureLogStream();
+    logStream.write(`[${new Date().toISOString()}] ${message}\n`);
+  }
+  ui.log(message);
 };
 
 function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TCP_PORT, LOCAL_UDP_HOST, LOCAL_UDP_PORT, ENABLE_HTTP_PORT, LOCAL_HTTP_HOST, LOCAL_HTTP_PORT) {
@@ -117,16 +211,15 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
   setInterval(() => {
     const workerTcpStatus = (control && !control.destroyed && controlAuthenticated) ? "YES" : "NO";
     const workerUdpStatus = (udpControl && !udpControl.destroyed && udpControlAuthenticated) ? "YES" : "NO";
-    const tcpCount = tcpSessions.size;
-    const udpCount = udpSessions.size;
 
-    consoleOnly("Stats for:", VPS_NAME);
-    consoleOnly("Worker TCP:", workerTcpStatus);
-    consoleOnly("TCP Sessions:", tcpCount);
-    consoleOnly("\nWorker UDP:", workerUdpStatus);
-    consoleOnly("UDP Sessions:", udpCount);
-    consoleOnly("\n")
-  }, 5000);
+    ui.status([
+      ["Tunnel", VPS_NAME],
+      ["Worker TCP", ui[(workerTcpStatus === "YES") ? "good" : "bad"](workerTcpStatus)],
+      ["Worker UDP", ui[(workerUdpStatus === "YES") ? "good" : "bad"](workerUdpStatus)],
+      ["TCP sessions", String(tcpSessions.size)],
+      ["UDP sessions", String(udpSessions.size)],
+    ]);
+  }, 1000);
 
   // ==================== Length-Prefixed Binary Protocol ====================
 
@@ -709,59 +802,122 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
 }
 
 // If an argument is passed, use it; otherwise use "client.json" in the current directory
-const CONFIG_PATH = process.argv[2]
-  ? path.resolve(process.cwd(), process.argv[2])
+const CONFIG_PATH = ARGS.positional[0]
+  ? path.resolve(process.cwd(), ARGS.positional[0])
   : path.join(__dirname, "client.json");
 
+const EXAMPLE_CONFIG = {
+  config: [{
+    vps: { socket: "IP:PORT", token: "YOUR_TOKEN_HERE" },
+    tcp: { enabled: true, socket: "127.0.0.1:7000" },
+    udp: { enabled: true, socket: "127.0.0.1:7000" },
+    http: { comment: "Detects HTTP to send to another socket. This can break some specific server-first games", enabled: false, socket: "127.0.0.1:8080" }
+  }]
+};
 
-// --- MAIN / CONFIGURATION LOADING ---
-if (!fs.existsSync(CONFIG_PATH)) {
-  const example = {
-    config: [{
-      vps: { socket: "IP:PORT", token: "YOUR_TOKEN_HERE" },
-      tcp: { enabled: true, socket: "127.0.0.1:7000" },
-      udp: { enabled: true, socket: "127.0.0.1:7000" },
-      http: { comment: "Detects HTTP to send to another socket. This can break some specific server-first games", enabled: false, socket: "127.0.0.1:8080" }
-    }]
-  };
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(example, null, 4));
-  console.log("Generated client.json. Configure it and restart.");
-  process.exit(0);
+function parseSocket(str, context) {
+  const parts = String(str).split(":");
+  if (parts.length !== 2 || !parts[0]) {
+    throw new Error(`[CONFIG ERROR] Invalid format in ${context}: "${str}". Expected "ip:port" (e.g. 127.0.0.1:8000)`);
+  }
+  const host = parts[0];
+  const port = parseInt(parts[1], 10);
+  if (isNaN(port) || port <= 0 || port > 65535) {
+    throw new Error(`[CONFIG ERROR] Port in ${context} ("${parts[1]}") is not a valid number.`);
+  }
+  return { host, port };
 }
 
-const { config } = JSON.parse(fs.readFileSync(CONFIG_PATH));
-config.forEach(c => {
-  const getSocketData = (str, context) => {
-    const parts = String(str).split(":");
-    if (parts.length !== 2) {
-      throw new Error(`[CONFIG ERROR] Invalid format in ${context}: "${str}". Expected "ip:port" (e.g. 127.0.0.1:8000)`);
+function isValidSocket(str) {
+  try { parseSocket(str, "x"); return true; } catch { return false; }
+}
+
+// --- Interactive first-run setup (only when stdin/stdout are a TTY) ---
+async function runSetup() {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q, def) => new Promise((resolve) => {
+    rl.question(def ? `${q} [${def}]: ` : `${q}: `, (a) => resolve(a.trim()));
+  });
+  const askSocket = async (q, def) => {
+    for (;;) {
+      const answer = def ? ((await ask(q, def)) || def) : await ask(q);
+      if (answer && isValidSocket(answer)) return answer;
+      ui.log("[-] Invalid, expected IP:port (e.g. 127.0.0.1:8000)");
     }
-
-    const host = parts[0];
-    const port = parseInt(parts[1]);
-
-    if (isNaN(port)) {
-      throw new Error(`[CONFIG ERROR] Port in ${context} ("${parts[1]}") is not a valid number.`);
-    }
-
-    return { host, port };
   };
 
-  const vpsData = getSocketData(c.vps.socket, "VPS SOCKET");
-  const tcpData = getSocketData(c.tcp.socket, "TCP SOCKET");
-  const udpData = getSocketData(c.udp.socket, "UDP SOCKET");
-  const httpData = getSocketData(c.http.socket, "HTTP SOCKET");
+  ui.banner("nodejs-tcp-udp-tunnel — setup", "no config found, a few quick questions");
+  console.log("Config not detected, asking for setup.");
 
-  console.log(`Configuring instance: ${c.vps.socket}`);
-  console.log(`>> TCP: ${c.tcp.enabled} ${c.tcp.socket}`);
-  console.log(`>> UDP: ${c.udp.enabled} ${c.udp.socket}`);
-  console.log(`>> HTTP: ${c.http.enabled} ${c.http.socket}`);
+  const vpsSocket = await askSocket("server socket (IP:port)");
 
-  StartTunnel(c.vps.socket, c.vps.token, vpsData.host, vpsData.port, tcpData.host, tcpData.port, udpData.host, udpData.port, c.http.enabled, httpData.host, httpData.port)
+  let token = "";
+  while (!token) {
+    token = await ask("token");
+    if (!token) ui.log("[-] Token is required");
+  }
+
+  let mode = "";
+  while (!["1", "2", "3"].includes(mode)) {
+    mode = (await ask("mode: 1 tcp, 2 udp, 3 tcp+udp", "3")) || "3";
+  }
+
+  const tcpSocket = await askSocket("tcp socket (IP:port)");
+  const udpSocket = await askSocket("udp socket (IP:port) (Enter for same as TCP)", tcpSocket);
+
+  let httpAnswer = "pending";
+  while (!["", "1", "2"].includes(httpAnswer)) {
+    httpAnswer = await ask("add http redirection to another socket? 1 no, 2 yes (Enter for no)", "1");
+  }
+  let httpSocket = "127.0.0.1:8080";
+  if (httpAnswer === "2") httpSocket = await askSocket("http socket (IP:port)", "127.0.0.1:8080");
+
+  rl.close();
+
+  const config = {
+    config: [{
+      vps: { socket: vpsSocket, token },
+      tcp: { enabled: mode === "1" || mode === "3", socket: tcpSocket },
+      udp: { enabled: mode === "2" || mode === "3", socket: udpSocket },
+      http: { comment: EXAMPLE_CONFIG.config[0].http.comment, enabled: httpAnswer === "2", socket: httpSocket }
+    }]
+  };
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 4));
+  console.log(`[+] Config saved to ${CONFIG_PATH}`);
+}
+
+// --- MAIN / CONFIGURATION LOADING ---
+async function main() {
+  if (!fs.existsSync(CONFIG_PATH)) {
+    if (process.stdin.isTTY) {
+      await runSetup();
+    } else {
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(EXAMPLE_CONFIG, null, 4));
+      console.log("Generated client.json. Configure it and restart.");
+      process.exit(0);
+    }
+  }
+
+  const { config } = JSON.parse(fs.readFileSync(CONFIG_PATH));
+  ui.banner("nodejs-tcp-udp-tunnel", "worker client");
+  console.log(NO_LOG ? "[*] Logging disabled" : `[*] Logging to ${LOG_DIR}`);
+
+  config.forEach(c => {
+    const vpsData = parseSocket(c.vps.socket, "VPS SOCKET");
+    const tcpData = parseSocket(c.tcp.socket, "TCP SOCKET");
+    const udpData = parseSocket(c.udp.socket, "UDP SOCKET");
+    const httpData = parseSocket(c.http.socket, "HTTP SOCKET");
+
+    console.log(`[*] Configuring instance: ${c.vps.socket}`);
+    console.log(`[*] TCP: ${c.tcp.enabled ? "on" : "off"} ${c.tcp.socket}`);
+    console.log(`[*] UDP: ${c.udp.enabled ? "on" : "off"} ${c.udp.socket}`);
+    console.log(`[*] HTTP: ${c.http.enabled ? "on" : "off"} ${c.http.socket}`);
+
+    StartTunnel(c.vps.socket, c.vps.token, vpsData.host, vpsData.port, tcpData.host, tcpData.port, udpData.host, udpData.port, c.http.enabled, httpData.host, httpData.port)
+  });
+}
+
+main().catch((err) => {
+  console.log(`[-] ${err.message}`);
+  process.exit(1);
 });
-
-setTimeout(() => {
-  setInterval(() => {
-    console.clear();
-  }, 5000);
-}, 4900);
