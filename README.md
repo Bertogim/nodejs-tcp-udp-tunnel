@@ -237,18 +237,14 @@ On startup the current mode is logged: `[*] IP display: hideip (last 2 octets ma
 
 ## Graceful Shutdown (Pterodactyl-compatible)
 
-Both processes shut down cleanly on `SIGINT` (Ctrl‑C), `SIGTERM`, `SIGHUP` and `SIGQUIT`, and also when:
+Both processes shut down cleanly on `SIGINT` (Ctrl‑C), `SIGTERM`, `SIGHUP` and `SIGQUIT`. **Stdin is never used for stopping** — earlier versions also stopped on a command or EOF on stdin, but some hosts (Wings included) deliver an immediate stdin EOF at boot, which made the server stop by itself right after starting. Stopping now depends only on signals, so nothing can kill the process accidentally.
 
-- a stop command (`stop`, `exit`, `quit`, `shutdown`, `end`) is written to **stdin**, or
-- **stdin reaches EOF** (e.g. the parent process closed the pipe).
-
-On shutdown the process closes listeners, drops active sessions/worker connections, closes the log file, and exits promptly (well under Pterodactyl's 30 s kill grace). This matters on Pterodactyl/Wings because the panel can stop a server in three different ways, and the egg stop command is typically configured to send `^C` (SIGINT):
+On shutdown the process closes listeners, drops active sessions/worker connections, closes the log file, and exits promptly (well under Pterodactyl's 30 s kill grace). This matters on Pterodactyl/Wings because the panel can stop a server in different ways:
 
 | Pterodactyl stop mechanism | What the process sees | Result |
 |----------------------------|----------------------|--------|
 | `SIGTERM` (default docker stop) | `SIGTERM` signal | Clean shutdown |
 | Egg stop command `^C` | `SIGINT` (Ctrl‑C) | Clean shutdown |
-| Command‑based stop (`stop` in the egg) | `stop\n` on stdin | Clean shutdown |
 
 Shutdown is idempotent — repeated signals during teardown are ignored and cannot hang the process.
 

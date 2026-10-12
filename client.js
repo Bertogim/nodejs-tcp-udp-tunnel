@@ -1,7 +1,7 @@
 // client.js
 
 // By Bertogim
-// v1.5.0
+// v1.5.1
 
 const net = require("net");
 const dgram = require("dgram");
@@ -11,7 +11,7 @@ const path = require("path");
 const readline = require("readline");
 const crypto = require("crypto");
 
-const VERSION = "1.5.0";
+const VERSION = "1.5.1";
 
 // TLS-PSK on the worker control channel (no certificates required). The key is
 // derived from the same token the server uses, so it must match on both ends.
@@ -242,7 +242,7 @@ Options:
 Environment: TLS=1, SHOW_IP/HIDE_IP, NO_LOG, LOG_DIR, UDP_SESSION_TIMEOUT_MS, MAX_UDP_SESSIONS.`);
 }
 
-// --- Graceful shutdown (Pterodactyl-friendly: SIGTERM/SIGINT or stdin command) ---
+// --- Graceful shutdown (Pterodactyl-friendly: SIGTERM/SIGINT only) ---
 const cleanupHooks = [];
 let shuttingDown = false;
 let exited = false;
@@ -1177,16 +1177,16 @@ async function main() {
     StartTunnel(c.vps.socket, c.vps.token, vpsData.host, vpsData.port, tcpData.host, tcpData.port, udpData.host, udpData.port, c.http.enabled, httpData.host, httpData.port, enableTls)
   });
 
-  // Pterodactyl may stop a server by writing a command to its stdin.
-  // "showip"/"hideip" switch the IP display mode live (and persist it).
+  // Stopping is handled exclusively by the signal handlers above (SIGINT,
+  // SIGTERM...). Nothing here reacts to stdin commands or EOF: some hosts
+  // deliver an immediate stdin EOF at boot, which used to stop the process by
+  // itself. stdin is only used for the live "showip"/"hideip" toggles.
   if (process.stdin && !process.stdin.destroyed) {
     process.stdin.on("data", (d) => {
       const line = d.toString().trim().toLowerCase();
-      if (["stop", "exit", "quit", "shutdown", "end"].includes(line)) shutdown("stdin", 0);
-      else if (line === "showip") setIpMode("show");
+      if (line === "showip") setIpMode("show");
       else if (line === "hideip") setIpMode("hide");
     });
-    process.stdin.on("end", () => shutdown("stdin-eof", 0));
     try { process.stdin.resume(); } catch { }
   }
 }

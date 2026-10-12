@@ -1,7 +1,7 @@
 // server.js
 
 // By Bertogim
-// v1.5.0
+// v1.5.1
 
 const net = require("net");
 const dgram = require("dgram");
@@ -11,7 +11,7 @@ const path = require("path");
 const readline = require('readline');
 const crypto = require('crypto');
 
-const VERSION = "1.5.0";
+const VERSION = "1.5.1";
 
 // TLS-PSK (no certificates needed) used for the worker control channel when
 // enabled. The key is derived from the token, so auth and encryption share the
@@ -1255,8 +1255,9 @@ async function main() {
   });
 
   // --- Graceful shutdown ---
-  // Compatible with Pterodactyl: Wings stops a server with SIGTERM (default),
-  // SIGINT (egg stop command "^C"), or by writing a stop command to stdin.
+  // Compatible with Pterodactyl: Wings stops a server with SIGTERM (default)
+  // or SIGINT (egg stop command "^C"). Stopping never depends on stdin, because
+  // some hosts deliver an immediate stdin EOF at boot (which self-stopped it).
   function shutdown(reason, code) {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -1295,16 +1296,17 @@ async function main() {
     shutdown("unhandledRejection", 1);
   });
 
-  // A command-based Pterodactyl stop writes e.g. "stop" to the process stdin.
-  // "showip"/"hideip" switch the IP display mode live (and persist it).
+  // Stopping is handled exclusively by the signal handlers above (SIGINT/"^C"
+  // egg stop, SIGTERM from Wings). Nothing here reacts to stdin commands or
+  // EOF: some hosts (Wings included) deliver an immediate stdin EOF at boot,
+  // which used to stop the server by itself. stdin is only used for the live
+  // "showip"/"hideip" display toggles (persisted).
   if (process.stdin && !process.stdin.destroyed) {
     process.stdin.on("data", (d) => {
       const line = d.toString().trim().toLowerCase();
-      if (["stop", "exit", "quit", "shutdown", "end"].includes(line)) shutdown("stdin", 0);
-      else if (line === "showip") setIpMode("show");
+      if (line === "showip") setIpMode("show");
       else if (line === "hideip") setIpMode("hide");
     });
-    process.stdin.on("end", () => shutdown("stdin-eof", 0));
     try { process.stdin.resume(); } catch { }
   }
 
