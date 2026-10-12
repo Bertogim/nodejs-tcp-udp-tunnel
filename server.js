@@ -1,24 +1,43 @@
 // server.js
 
 // By Bertogim
-// v1.0.0
+// v1.4.0
 
 const net = require("net");
 const dgram = require("dgram");
+const tls = require("tls");
 const fs = require("fs");
 const path = require("path");
 const readline = require('readline');
 const crypto = require('crypto');
 
+const VERSION = "1.4.0";
+
+// TLS-PSK (no certificates needed) used for the worker control channel when
+// enabled. The key is derived from the token, so auth and encryption share the
+// same secret and no certificate files have to be deployed alongside.
+const TLS_MAGIC = Buffer.from("TUNS");
+const TLS_IDENTITY = "TUN1";
+const TLS_CIPHERS = "PSK-AES256-GCM-SHA384:PSK-AES128-GCM-SHA256:PSK-CHACHA20-POLY1305";
+
 // --- CLI arguments ---
-// Usage: node server.js [port] [--log-dir <path>] [--no-log]
+// Usage: node server.js [port] [--log-dir <path>] [--no-log] [--tls]
+//        [--blacklist <file>] [--bind <ip>]
 function parseArgs(argv) {
-  const opts = { positional: [], logDir: null, noLog: false };
+  const opts = { positional: [], logDir: null, noLog: false, version: false, help: false, tls: false, blacklist: null, bind: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--no-log" || a === "--no-logs") opts.noLog = true;
     else if (a === "--log-dir") opts.logDir = argv[++i] || null;
     else if (a.startsWith("--log-dir=")) opts.logDir = a.slice("--log-dir=".length);
+    else if (a === "--tls") opts.tls = true;
+    else if (a === "--no-tls") opts.tls = false;
+    else if (a === "--blacklist") opts.blacklist = argv[++i] || null;
+    else if (a.startsWith("--blacklist=")) opts.blacklist = a.slice("--blacklist=".length);
+    else if (a === "--bind") opts.bind = argv[++i] || null;
+    else if (a.startsWith("--bind=")) opts.bind = a.slice("--bind=".length);
+    else if (a === "--version" || a === "-v") opts.version = true;
+    else if (a === "--help" || a === "-h") opts.help = true;
     else opts.positional.push(a);
   }
   return opts;
@@ -43,6 +62,7 @@ const getLogFileName = () => {
 
 let logFilePath = null;
 let logStream = null;
+let logClosed = false;
 
 const originalLog = console.log;
 
@@ -137,12 +157,166 @@ const ui = (() => {
 
 console.log = function (...args) {
   const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
-  if (!NO_LOG) {
+  if (!NO_LOG && !logClosed) {
     ensureLogStream();
     logStream.write(`[${new Date().toISOString()}] ${message}\n`);
   }
   ui.log(message);
 };
+
+// --- CLI help ---
+function printHelp() {
+  originalLog.call(console, `nodejs-tcp-udp-tunnel server v${VERSION}
+
+Usage: node server.js [port] [options]
+
+Options:
+  --bind <ip>          Address to listen on (default 0.0.0.0)
+  --tls                Require TLS-PSK on the worker control connection
+                       (the client must enable tls in its config)
+  --blacklist <file>   Load IP/CIDR blacklist entries from a file
+  --log-dir <path>     Directory for log files (default server-logs/)
+  --no-log             Disable file logging
+  -h, --help           Show this help and exit
+  -v, --version        Show version and exit
+
+Environment: SERVER_PORT/PORT, BIND_HOST, TLS=1, IP_BLACKLIST, BLACKLIST_FILE,
+  LOG_DIR, NO_LOG, MAX_CONNECTIONS, CONN_RATE_LIMIT_PER_IP and more (see README).`);
+}
+
+// --- IP blacklist (CIDR-aware, IPv4 + IPv6) ---
+// Every address is normalized to a 16-byte form (IPv4 is mapped as
+// ::ffff:a.b.c.d) so a single prefix match handles both families.
+let BLACKLIST = null;
+
+function normalizeIP(ip) {
+  const s = String(ip || "");
+  return s.startsWith("::ffff:") ? s.slice(7) : s;
+}
+
+function parseIPv4ToBytes(ip) {
+  const parts = String(ip).split(".");
+  if (parts.length !== 4) return null;
+  const out = Buffer.alloc(4);
+  for (let i = 0; i < 4; i++) {
+    if (!/^\d{1,3}$/.test(parts[i])) return null;
+    const n = Number(parts[i]);
+    if (n < 0 || n > 255) return null;
+    out[i] = n;
+  }
+  return out;
+}
+
+function parseIPv6ToBytes(ip) {
+  let str = String(ip);
+  const doubleIdx = str.indexOf("::");
+  if (str.indexOf("::", doubleIdx + 1) !== -1) return null;
+  const expand = (part) => {
+    const groups = [];
+    if (part === "") return groups;
+    for (const g of part.split(":")) {
+      if (g.includes(".")) {
+        const v4 = parseIPv4ToBytes(g);
+        if (!v4) return null;
+        groups.push(v4.readUInt16BE(0), v4.readUInt16BE(2));
+      } else {
+        if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+        groups.push(parseInt(g, 16));
+      }
+    }
+    return groups;
+  };
+  let groups;
+  if (doubleIdx === -1) {
+    groups = expand(str);
+    if (!groups || groups.length !== 8) return null;
+  } else {
+    const head = expand(str.slice(0, doubleIdx));
+    const tail = expand(str.slice(doubleIdx + 2));
+    if (!head || !tail) return null;
+    const fill = 8 - head.length - tail.length;
+    if (fill < 0) return null;
+    groups = head.concat(new Array(fill).fill(0), tail);
+  }
+  const out = Buffer.alloc(16);
+  for (let i = 0; i < 8; i++) out.writeUInt16BE(groups[i] & 0xffff, i * 2);
+  return out;
+}
+
+function ipTo16Bytes(ip) {
+  const norm = normalizeIP(ip);
+  const v4 = parseIPv4ToBytes(norm);
+  if (v4) return Buffer.concat([Buffer.alloc(10), Buffer.from([0xff, 0xff]), v4]);
+  return parseIPv6ToBytes(norm);
+}
+
+function prefixMask(prefix) {
+  const mask = Buffer.alloc(16);
+  for (let i = 0; i < 16; i++) {
+    const left = prefix - i * 8;
+    mask[i] = left >= 8 ? 0xff : left <= 0 ? 0x00 : (0xff << (8 - left)) & 0xff;
+  }
+  return mask;
+}
+
+function parseBlacklistEntry(text) {
+  const raw = String(text).trim();
+  if (!raw || raw.startsWith("#")) return null;
+  const [addr, prefixStr] = raw.split("/");
+  const v4 = parseIPv4ToBytes(addr);
+  let bytes, prefix;
+  if (v4) {
+    bytes = Buffer.concat([Buffer.alloc(10), Buffer.from([0xff, 0xff]), v4]);
+    prefix = 96 + (prefixStr === undefined ? 32 : Number(prefixStr));
+  } else {
+    const v6 = parseIPv6ToBytes(addr);
+    if (!v6) return null;
+    bytes = v6;
+    prefix = prefixStr === undefined ? 128 : Number(prefixStr);
+  }
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 128) return null;
+  return { base: bytes, mask: prefixMask(prefix), prefix };
+}
+
+function loadBlacklist() {
+  const entries = [];
+  const sources = [];
+  const seen = new Set();
+  const add = (text, source) => {
+    for (const line of String(text).split(/[\n,;]+/)) {
+      const entry = parseBlacklistEntry(line);
+      if (entry) {
+        const key = entry.base.toString("hex") + "/" + entry.prefix;
+        if (!seen.has(key)) { seen.add(key); entry.source = source; entries.push(entry); }
+      } else if (line.trim() && !line.trim().startsWith("#")) {
+        console.log(`[-] Ignoring invalid blacklist entry: "${line.trim()}"`);
+      }
+    }
+  };
+  const explicitFile = ARGS.blacklist || process.env.BLACKLIST_FILE;
+  const defaultFile = path.join(__dirname, "blacklist.txt");
+  const file = explicitFile || (fs.existsSync(defaultFile) ? defaultFile : null);
+  if (file) {
+    if (fs.existsSync(file)) { add(fs.readFileSync(file, "utf8"), file); sources.push(file); }
+    else console.log(`[-] Blacklist file not found: ${file}`);
+  }
+  if (process.env.IP_BLACKLIST) { add(process.env.IP_BLACKLIST, "IP_BLACKLIST"); sources.push("IP_BLACKLIST"); }
+  return { entries, sources };
+}
+
+function isBlacklisted(ip) {
+  if (!BLACKLIST || BLACKLIST.entries.length === 0) return false;
+  const bytes = ipTo16Bytes(ip);
+  if (!bytes) return false;
+  for (const e of BLACKLIST.entries) {
+    let match = true;
+    for (let i = 0; i < 16; i++) {
+      if ((bytes[i] & e.mask[i]) !== (e.base[i] & e.mask[i])) { match = false; break; }
+    }
+    if (match) return true;
+  }
+  return false;
+}
 
 // --- Token handling ---
 function getToken() {
@@ -163,7 +337,10 @@ function getToken() {
 }
 
 async function main() {
-  ui.banner("nodejs-tcp-udp-tunnel", "server");
+  if (ARGS.help) { printHelp(); process.exit(0); }
+  if (ARGS.version) { originalLog.call(console, VERSION); process.exit(0); }
+
+  ui.banner(`nodejs-tcp-udp-tunnel v${VERSION}`, "server");
   console.log(NO_LOG ? "[*] Logging disabled" : `[*] Logging to ${LOG_DIR}`);
   let detectedPort = getPort();
   if (!detectedPort) {
@@ -172,6 +349,9 @@ async function main() {
 
   const PORT = detectedPort;
   const TOKEN = getToken();                    // ← token from file
+  BLACKLIST = loadBlacklist();
+  const TLS_ENABLED = ARGS.tls || /^(1|true|yes|on)$/i.test(process.env.TLS || process.env.TLS_ENABLED || "");
+  const BIND_HOST = ARGS.bind || process.env.BIND_HOST || "0.0.0.0";
   const BUFFER_SIZE = 256 * 1024;
   const MAX_PARSER_BUFFER = 1024 * 1024;      // 1 MB max parser buffer size
   const WORKER_HANDSHAKE_TIMEOUT_MS = 250;
@@ -214,6 +394,13 @@ async function main() {
   const TCP_AUTH_PAYLOAD = `TUN1 ${TOKEN}`;
   const UDP_AUTH_PAYLOAD = `${WORKER_UDP_AUTH_PREFIX} ${TOKEN}`;
 
+  console.log(TLS_ENABLED
+    ? "[*] Control TLS: ENABLED (TLS-PSK 1.2, key derived from the token)"
+    : "[*] Control TLS: disabled (start with --tls or TLS=1 to encrypt the control channel)");
+  if (BLACKLIST.entries.length > 0) {
+    console.log(`[*] IP blacklist active: ${BLACKLIST.entries.length} entr${BLACKLIST.entries.length === 1 ? "y" : "ies"} from ${BLACKLIST.sources.join(", ")}`);
+  }
+
   let worker = null;
   let workerUdpEndpoint = null;
   let workerConnected = false;
@@ -231,6 +418,12 @@ async function main() {
   const udpRateLimit = new Map();   // ip -> { count, windowStart }
   const authFailLogAt = new Map();  // ip -> last log timestamp
 
+  // --- Graceful shutdown bookkeeping ---
+  const shutdownHooks = [];
+  let shuttingDown = false;
+  let exited = false;
+  const trackInterval = (id) => { shutdownHooks.push(() => clearInterval(id)); return id; };
+
   // --- Stats loop ---
   const fmtList = (iterable) => {
     const list = Array.from(iterable).sort();
@@ -238,7 +431,7 @@ async function main() {
     return shown.join(" ") + (list.length > shown.length ? ` +${list.length - shown.length}` : "");
   };
 
-  setInterval(() => {
+  trackInterval(setInterval(() => {
     const now = Date.now();
     const active = new Set();
 
@@ -273,10 +466,10 @@ async function main() {
       ["Sessions", fmtList(sessionIPs)],
     ]);
     if (sessionIPs.size > MAX_SESSION_IPS) sessionIPs.clear();
-  }, 5000);
+  }, 5000));
 
   const UDP_TIMEOUT = 60 * 1000;
-  setInterval(() => {
+  trackInterval(setInterval(() => {
     const now = Date.now();
     for (const [key, client] of udpClients.entries()) {
       if (now - client.lastSeen > UDP_TIMEOUT) udpClients.delete(key);
@@ -292,7 +485,7 @@ async function main() {
     for (const [ip, t] of authFailLogAt) {
       if (now - t > LOG_FAIL_THROTTLE_MS) authFailLogAt.delete(ip);
     }
-  }, 10000);
+  }, 10000));
 
   // --- Helper functions ---
   // Constant-time string compare for secrets (token). Falls back to false on
@@ -671,7 +864,7 @@ async function main() {
       handleWorkerMessage(msg);
     });
 
-    parse(firstChunk);
+    if (firstChunk && firstChunk.length) parse(firstChunk);
     sock.on("data", parse);
   }
 
@@ -828,11 +1021,33 @@ async function main() {
     });
   }
 
+  // --- TLS-PSK control server (only when enabled) ---
+  let tlsServer = null;
+  if (TLS_ENABLED) {
+    const psk = crypto.createHash("sha256").update(TOKEN).digest();
+    tlsServer = tls.createServer({
+      ciphers: TLS_CIPHERS,
+      minVersion: "TLSv1.2",
+      maxVersion: "TLSv1.2",
+      pskCallback: (socket, identity) => (identity === TLS_IDENTITY ? { psk, identity } : null),
+    }, (tlsSock) => {
+      handleWorkerConnection(tlsSock, null);
+    });
+    tlsServer.on("error", (err) => console.log(`[-] TLS server error: ${err.message}`));
+  }
+
   // --- Servers ---
   const tcpServer = net.createServer({
     highWaterMark: CLIENT_SOCKET_HIGH_WATERMARK,
     pauseOnConnect: false
   }, (sock) => {
+    if (isBlacklisted(sock.remoteAddress)) {
+      stats.errors++;
+      logThrottled(sock.remoteAddress, `[-] ${sock.remoteAddress}: blocked by IP blacklist`);
+      sock.on('error', () => {});
+      sock.destroy();
+      return;
+    }
     if (!allowRate(tcpRateLimit, sock.remoteAddress, CONN_RATE_LIMIT_PER_IP)) {
       stats.errors++;
       logThrottled(sock.remoteAddress, `[-] ${sock.remoteAddress}: TCP connection rate limit exceeded`);
@@ -855,6 +1070,30 @@ async function main() {
       clearTimeout(handshakeTimer);
       classified = true;
 
+      if (TLS_ENABLED) {
+        // Worker control connections start with a magic prefix followed by the
+        // TLS ClientHello. Feed the socket to the TLS server, keeping any bytes
+        // that arrived glued to the magic in the same packet.
+        if (firstChunk.length >= TLS_MAGIC.length && firstChunk.subarray(0, TLS_MAGIC.length).equals(TLS_MAGIC)) {
+          sock.pause();
+          const rest = firstChunk.subarray(TLS_MAGIC.length);
+          if (rest.length) sock.unshift(rest);
+          tlsServer.emit("connection", sock);
+          return;
+        }
+        // A plaintext worker handshake while TLS is required is a downgrade
+        // attempt: drop it instead of forwarding it to the local service.
+        if (isWorkerHandshakeChunk(firstChunk)) {
+          stats.errors++;
+          logThrottled(sock.remoteAddress, `[-] ${sock.remoteAddress}: plaintext worker rejected (TLS required)`);
+          sock.on('error', () => {});
+          sock.destroy();
+          return;
+        }
+        handlePublicTcp(sock, firstChunk);
+        return;
+      }
+
       if (isWorkerHandshakeChunk(firstChunk)) {
         handleWorkerConnection(sock, firstChunk);
       } else {
@@ -875,23 +1114,25 @@ async function main() {
 
   const udpServer = dgram.createSocket("udp4");
 
-  setInterval(() => {
+  trackInterval(setInterval(() => {
     if (!worker || worker.destroyed) return;
     if (Date.now() - (worker.lastHeartbeatAt || 0) > WORKER_HEARTBEAT_TIMEOUT_MS) {
       console.log("[-] worker heartbeat timed out, closing stale control socket");
       try { worker.destroy(); } catch { }
     }
-  }, 10_000);
+  }, 10_000));
 
-  setInterval(() => {
+  trackInterval(setInterval(() => {
     if (!workerUdpEndpoint) return;
     if (Date.now() - workerUdpEndpoint.lastSeen > WORKER_UDP_TIMEOUT_MS) {
       console.log("[-] worker UDP endpoint timed out");
       workerUdpEndpoint = null;
     }
-  }, 10_000);
+  }, 10_000));
 
   udpServer.on("message", (msg, rinfo) => {
+    if (isBlacklisted(rinfo.address)) return;
+
     if (isWorkerAuthHello(msg)) {
       workerUdpEndpoint = {
         address: rinfo.address,
@@ -919,12 +1160,63 @@ async function main() {
     console.log(`[-] UDP server error: ${err.message}`);
   });
 
-  tcpServer.listen(PORT, "0.0.0.0", () => {
-    console.log(`[*] TCP listening on ${PORT}`);
+  // --- Graceful shutdown ---
+  // Compatible with Pterodactyl: Wings stops a server with SIGTERM (default),
+  // SIGINT (egg stop command "^C"), or by writing a stop command to stdin.
+  function shutdown(reason, code) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const finish = () => { if (exited) return; exited = true; process.exit(code || 0); };
+    console.log(`[*] Shutting down (${reason})...`);
+    logClosed = true;
+    for (const hook of shutdownHooks) { try { hook(); } catch { } }
+    try { tcpServer.close(); } catch { }
+    try { udpServer.close(); } catch { }
+    if (tlsServer) { try { tlsServer.close(); } catch { } }
+    for (const session of tcpSessions.values()) {
+      try { if (session.socket) session.socket.destroy(); } catch { }
+    }
+    tcpSessions.clear();
+    udpClients.clear();
+    if (worker) { try { worker.destroy(); } catch { } }
+    if (logStream && !logStream.destroyed) {
+      try { logStream.end(finish); } catch { finish(); }
+      setTimeout(finish, 1500);
+    } else {
+      finish();
+    }
+  }
+
+  const handleSignal = (sig) => () => shutdown(sig, 0);
+  process.on("SIGINT", handleSignal("SIGINT"));
+  process.on("SIGTERM", handleSignal("SIGTERM"));
+  process.on("SIGHUP", handleSignal("SIGHUP"));
+  process.on("SIGQUIT", handleSignal("SIGQUIT"));
+  process.on("uncaughtException", (err) => {
+    console.log(`[-] uncaughtException: ${err && err.stack ? err.stack : err}`);
+    shutdown("uncaughtException", 1);
+  });
+  process.on("unhandledRejection", (err) => {
+    console.log(`[-] unhandledRejection: ${err && err.stack ? err.stack : err}`);
+    shutdown("unhandledRejection", 1);
   });
 
-  udpServer.bind(PORT, "0.0.0.0", () => {
-    console.log(`[*] UDP listening on ${PORT}`);
+  // A command-based Pterodactyl stop writes e.g. "stop" to the process stdin.
+  if (process.stdin && !process.stdin.destroyed) {
+    process.stdin.on("data", (d) => {
+      const line = d.toString().trim().toLowerCase();
+      if (["stop", "exit", "quit", "shutdown", "end"].includes(line)) shutdown("stdin", 0);
+    });
+    process.stdin.on("end", () => shutdown("stdin-eof", 0));
+    try { process.stdin.resume(); } catch { }
+  }
+
+  tcpServer.listen(PORT, BIND_HOST, () => {
+    console.log(`[*] TCP listening on ${BIND_HOST}:${PORT}`);
+  });
+
+  udpServer.bind(PORT, BIND_HOST, () => {
+    console.log(`[*] UDP listening on ${BIND_HOST}:${PORT}`);
     console.log(`[*] Server ready - Client socket highWaterMark: ${CLIENT_SOCKET_HIGH_WATERMARK / 1024}KB`);
   });
 }

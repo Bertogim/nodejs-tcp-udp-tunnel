@@ -34,6 +34,8 @@ node server.js 8080
 
 - The server automatically creates a `server-logs/` folder and writes a new log file per run (timestamped). See [Logging](#logging) to change the directory or disable it.
 
+- The server listens on all interfaces (`0.0.0.0`) by default. Use `--bind <ip>` to restrict it, `--tls` to require an encrypted control channel, and `--blacklist <file>` to load deny‑listed IPs. Run `node server.js --help` for all options (see [Command Line Flags](#command-line-flags)).
+
 ---
 
 ### 3. Client setup (on your local machine)
@@ -50,6 +52,7 @@ mode: 1 tcp, 2 udp, 3 tcp+udp [3]:
 tcp socket (IP:port): 127.0.0.1:25565
 udp socket (IP:port) (Enter for same as TCP) [127.0.0.1:25565]:
 add http redirection to another socket? 1 no, 2 yes (Enter for no) [1]:
+encrypt the control channel with TLS? 1 no, 2 yes (Enter for no) [1]:
 ```
 
 - The `client.json` file must have this structure:
@@ -73,6 +76,9 @@ add http redirection to another socket? 1 no, 2 yes (Enter for no) [1]:
             "http": {
                 "enabled": false,
                 "socket": "LOCALIP:PORT"
+            },
+            "tls": {
+                "enabled": false
             }
         }
     ]
@@ -86,6 +92,7 @@ Explanation of the fields:
 - **`tcp.socket`**: address and port of the local TCP service you want to expose (e.g., `127.0.0.1:22` for SSH, `127.0.0.1:25565` for Minecraft).
 - **`udp.socket`**: address and port of the local UDP service.
 - **`http`** (optional): when enabled (`enabled: true`), the client inspects the first bytes of each new TCP connection. If it looks like an HTTP request (starts with `GET`, `POST`, etc.), it routes to the specified HTTP port instead of the TCP port. **Caution**: This can break some specific server-first games.
+- **`tls`** (optional): when `enabled: true`, the worker control connection is encrypted with TLS-PSK (see [Control Channel Security (TLS)](#control-channel-security-tls)). The server must be started with `--tls` or `TLS=1`, otherwise it will reject the encrypted handshake.
 
 Run the client:
 
@@ -157,6 +164,102 @@ Authentication is performed by sending `TUN1 <token>` inside an `AUTH_HELLO` mes
 
 ---
 
+## Control Channel Security (TLS)
+
+The worker control connection (the TCP link between the server and the client that carries the token and all tunnel metadata) can be encrypted with **TLS‑PSK 1.2**. No certificates are needed — the pre‑shared key is derived automatically from the token (`SHA‑256(token)`), so there is nothing extra to configure or exchange.
+
+- **Server**: start with `--tls` (or `TLS=1`). When enabled the server **refuses plaintext worker handshakes** (`plaintext worker rejected (TLS required)`), so an attacker cannot force a downgrade.
+- **Client**: enable `tls: { "enabled": true }` in `client.json`, or pass `--tls` / set `TLS=1`.
+- TLS is **opt‑in and off by default**, so existing plaintext deployments keep working unchanged. When the server runs plaintext, clients with TLS enabled will not be able to connect (and vice versa) — both sides must agree.
+- Ciphers: `PSK-AES256-GCM-SHA384`, `PSK-AES128-GCM-SHA256`, `PSK-CHACHA20-POLY1305` (TLS 1.2 only).
+
+> **Note on the data plane**: TLS protects the control channel only. Forwarded TCP data and UDP datagrams still travel between server and client as they always did. For full end‑to‑end encryption of the *tunneled* traffic you still need to layer your own encryption on top (e.g. WireGuard, an SSH tunnel on another port, or application‑level TLS like Minecraft's built‑in encryption).
+
+---
+
+## IP Blacklist (with CIDR subnets)
+
+The server can block IP addresses from using the tunnel. Both TCP connections and UDP datagrams from a blocked source are dropped immediately.
+
+- **IPv4 and IPv6** are supported, including **CIDR subnets**: `203.0.113.7`, `203.0.113.0/24`, `2001:db8::/32`. IPv4 addresses are matched against their IPv4‑mapped form.
+- **File formats**: one entry per line, `#` comments and blank lines allowed. Entries can also be separated by commas or semicolons.
+
+Load blacklist entries from any of these (all are combined; invalid lines are ignored with a warning):
+
+| Source | How |
+|--------|-----|
+| `--blacklist <file>` | CLI flag (recommended) |
+| `BLACKLIST_FILE=<path>` | Environment variable |
+| `IP_BLACKLIST="1.2.3.4, 5.6.7.0/24"` | Environment variable with inline entries |
+| `blacklist.txt` | Auto‑loaded from the server's own directory if present |
+
+Example `blacklist.txt`:
+
+```
+# deny one host
+198.51.100.10
+# deny a whole /24
+198.51.100.0/24
+# deny an IPv6 prefix
+2001:db8:dead::/48
+```
+
+When the blacklist is active the server logs `IP blacklist active: N entries from <sources>` at startup, and each blocked attempt is logged (throttled per IP).
+
+---
+
+## Graceful Shutdown (Pterodactyl-compatible)
+
+Both processes shut down cleanly on `SIGINT` (Ctrl‑C), `SIGTERM`, `SIGHUP` and `SIGQUIT`, and also when:
+
+- a stop command (`stop`, `exit`, `quit`, `shutdown`, `end`) is written to **stdin**, or
+- **stdin reaches EOF** (e.g. the parent process closed the pipe).
+
+On shutdown the process closes listeners, drops active sessions/worker connections, closes the log file, and exits promptly (well under Pterodactyl's 30 s kill grace). This matters on Pterodactyl/Wings because the panel can stop a server in three different ways, and the egg stop command is typically configured to send `^C` (SIGINT):
+
+| Pterodactyl stop mechanism | What the process sees | Result |
+|----------------------------|----------------------|--------|
+| `SIGTERM` (default docker stop) | `SIGTERM` signal | Clean shutdown |
+| Egg stop command `^C` | `SIGINT` (Ctrl‑C) | Clean shutdown |
+| Command‑based stop (`stop` in the egg) | `stop\n` on stdin | Clean shutdown |
+
+Shutdown is idempotent — repeated signals during teardown are ignored and cannot hang the process.
+
+---
+
+## Command Line Flags
+
+Server (`node server.js [port] [options]`):
+
+| Flag | Description |
+|------|-------------|
+| `--bind <ip>` | Address to listen on (default `0.0.0.0`) |
+| `--tls` | Require TLS‑PSK on the worker control connection |
+| `--blacklist <file>` | Load IP/CIDR blacklist entries from a file |
+| `--log-dir <path>` | Directory for log files (default `server-logs/`) |
+| `--no-log` | Disable file logging |
+| `-h, --help` | Show help and exit |
+| `-v, --version` | Show version and exit |
+
+Client (`node client.js [config.json] [options]`):
+
+| Flag | Description |
+|------|-------------|
+| `--tls` | Encrypt the worker control connection (server must use `--tls`) |
+| `--log-dir <path>` | Directory for log files (default `worker-logs/`) |
+| `--no-log` | Disable file logging |
+| `-h, --help` | Show help and exit |
+| `-v, --version` | Show version and exit |
+
+`--version` and `--help` work on both programs, so you can always check the exact semantics:
+
+```bash
+node server.js --help
+node client.js --version
+```
+
+---
+
 ## Monitoring
 
 Both server and client print periodic statistics to the console:
@@ -196,7 +299,7 @@ NO_LOG=1 node client.js /path/to/config.json
 The test suite spins up a real `server.js` + `client.js` + local origin service on loopback ports and checks behaviour end to end. It needs `git` (used to fetch the `v1.0.0` baseline for the regression test) and is Linux/macOS only (memory/CPU sampling reads `/proc`). No dev dependencies are required.
 
 ```bash
-npm test        # correctness suite: isolation, integrity, uplink, bounded memory
+npm test        # full correctness suite (9 suites, see below)
 npm run bench   # throughput + CPU benchmark (tune with N_READERS, DURATION_MS)
 ```
 
@@ -210,6 +313,8 @@ npm run test:udp          # steady-state UDP flow is not throttled (game-style b
 npm run test:mem          # asserts server RSS stays bounded under 100 slow clients
 npm run test:auth         # wrong token is rejected; incomplete handshake times out; logs throttled
 npm run test:ratelimit    # per-IP connection rate limit drops excess connections
+npm run test:tls          # TLS control channel: works end-to-end, plaintext/wrong-token rejected
+npm run test:blacklist    # IP blacklist: single IP + CIDR blocked on TCP and UDP
 ```
 
 The `test:regression` suite is the sensitivity check: it runs the pre-optimization `v1.0.0` server and expects it to stall a fast client while another client is paused. If that ever stops failing, the isolation guarantee has regressed.
@@ -229,7 +334,8 @@ The `test:regression` suite is the sensitivity check: it runs the pre-optimizati
 
 ### What is NOT protected (threat model)
 
-- **No transport encryption.** The control connection is plain TCP and the token travels in the clear inside `AUTH_HELLO`. An on-path/MITM attacker can steal the token and impersonate the worker. Run the tunnel only over a trusted network, or front it with TLS/SSH (this is the main open item).
+- **Transport encryption is optional.** By default the control connection is plain TCP and the token travels in the clear inside `AUTH_HELLO`; start the server with `--tls` and the client with `tls.enabled` to encrypt the control channel with TLS‑PSK (see [Control Channel Security (TLS)](#control-channel-security-tls)). While TLS is enabled the server rejects plaintext worker handshakes, protecting against token theft by on‑path/MITM attackers. Without TLS, run the tunnel only over a trusted network.
+- **Forwarded traffic is not encrypted.** TLS protects the *control* channel; the tunneled TCP/UDP data is still relayed unencrypted. If the tunneled service carries sensitive data you should layer your own encryption on top.
 - **UDP is unauthenticated per datagram** and cannot be encrypted by this design; source addresses are spoofable, so UDP tunnels can be abused as relays/amplifiers.
 - **The public port is an open relay by design.** Anyone who can reach it gets their TCP connection forwarded to your local service. Security of that service (SSH keys, game auth, etc.) is what actually protects it.
 - Limits are **soft** protections for availability, not confidentiality.
@@ -240,6 +346,11 @@ The `test:regression` suite is the sensitivity check: it runs the pre-optimizati
 
 | Variable       | Description                           | Default |
 |----------------|---------------------------------------|---------|
+| `PORT` / `SERVER_PORT` | Port to listen on (also positional arg) | (prompt) |
+| `BIND_HOST`    | Address to listen on (also `--bind`) | `0.0.0.0` |
+| `TLS` / `TLS_ENABLED` | Set to `1`/`true` to require TLS‑PSK on the control channel (also `--tls`) | (disabled) |
+| `IP_BLACKLIST` | Inline IP/CIDR blacklist entries, comma/`;`/newline separated | (none) |
+| `BLACKLIST_FILE` | Load IP/CIDR blacklist entries from a file (also `--blacklist`) | (none) |
 | `LOG_DIR`      | Directory for log files (also `--log-dir`) | `server-logs/` |
 | `NO_LOG`       | Set to `1` to disable file logging (also `--no-log`) | (enabled) |
 | `CLIENT_SOCKET_HIGH_WATERMARK` | Write buffer threshold (bytes) for public client sockets before backpressure kicks in | `262144` (256 KB) |
@@ -255,12 +366,27 @@ The `test:regression` suite is the sensitivity check: it runs the pre-optimizati
 
 ---
 
+## Environment Variables (Client)
+
+| Variable       | Description                           | Default |
+|----------------|---------------------------------------|---------|
+| `TLS` / `TLS_ENABLED` | Set to `1`/`true` to encrypt the control channel (also `--tls` or `tls.enabled` in config) | (disabled) |
+| `LOG_DIR`      | Directory for log files (also `--log-dir`) | `worker-logs/` |
+| `NO_LOG`       | Set to `1` to disable file logging (also `--no-log`) | (enabled) |
+| `UDP_SESSION_TIMEOUT_MS` | Idle timeout for per‑source UDP sessions. Active flows refresh on every packet, so game traffic is never evicted | `60000` (60 s) |
+| `MAX_UDP_SESSIONS` | Hard cap on tracked per‑source UDP sessions (LRU eviction when full) | `4096` |
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely Cause | Solution |
 |---------|--------------|----------|
 | Connection refused | Server not running or firewall blocking port | Start the server; allow TCP and UDP on the port in the firewall. |
 | Authentication failed | Token mismatch | Copy the exact token from the server's `token` file to `client.json`. |
+| "TLS required" / connection drops instantly | One side has TLS on and the other off | Enable TLS on both sides (server `--tls`, client `tls.enabled: true`). |
+| IP is blocked (TCP dropped / UDP ignored) | Blacklist entry matches the source IP | Remove the IP/CIDR from `blacklist.txt`, `--blacklist <file>`, or `IP_BLACKLIST`. |
+| Both sides kept the same `--tls` but connection still fails | `token` file predates TLS / was regenerated | TLS derives its key from the token — delete `token`, restart the server, and copy the new value to the client. |
 | UDP not working | UDP port blocked or client UDP socket not connected | Ensure both TCP and UDP are open on the hosting firewall. Check client logs for UDP errors. |
 | High memory usage | Too many slow clients buffering data | Lower `GLOBAL_QUEUE_BUDGET` or `MAX_PER_SESSION_QUEUE` (env vars on the server). |
 | Client disconnects repeatedly | Heartbeat timeout | Check network stability; increase `HEARTBEAT_TIMEOUT_MS` in the code if needed. |

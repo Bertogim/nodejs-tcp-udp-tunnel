@@ -1,6 +1,6 @@
 {
   "name": "nodejs-tcp-udp-tunnel",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Standalone TCP/UDP tunnel over a single port with no external dependencies.",
   "license": "GPL-3.0-or-later",
   "author": "Bertogim",
@@ -9,7 +9,7 @@
     "url": "https://github.com/Bertogim/nodejs-tcp-udp-tunnel.git"
   },
   "scripts": {
-    "test": "npm run test:e2e && npm run test:regression && npm run test:uplink && npm run test:udp && npm run test:mem && npm run test:auth && npm run test:ratelimit",
+    "test": "npm run test:e2e && npm run test:regression && npm run test:uplink && npm run test:udp && npm run test:mem && npm run test:auth && npm run test:ratelimit && npm run test:tls && npm run test:blacklist",
     "test:e2e": "ASSERT=1 node test/e2e.js",
     "test:regression": "ASSERT=1 MODE=old node test/e2e.js",
     "test:uplink": "ASSERT=1 CLIENTS=4 TOTAL=8388608 node test/uplink.js",
@@ -17,6 +17,8 @@
     "test:mem": "ASSERT=1 N=100 MAX_RSS_MB=230 node test/memtest.js",
     "test:auth": "ASSERT=1 node test/auth.js",
     "test:ratelimit": "ASSERT=1 node test/ratelimit.js",
+    "test:tls": "ASSERT=1 node test/tls.js",
+    "test:blacklist": "ASSERT=1 node test/blacklist.js",
     "bench": "node test/stress.js"
   },
   "engines": {
