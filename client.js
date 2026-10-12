@@ -1,7 +1,7 @@
 // client.js
 
 // By Bertogim
-// v1.6.1
+// v1.6.2
 
 const net = require("net");
 const dgram = require("dgram");
@@ -11,7 +11,7 @@ const path = require("path");
 const readline = require("readline");
 const crypto = require("crypto");
 
-const VERSION = "1.6.1";
+const VERSION = "1.6.2";
 
 // TLS-PSK on the worker control channel (no certificates required). The key is
 // derived from the same token the server uses, so it must match on both ends.
@@ -461,6 +461,7 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
       [
         ["PPs", String(pps)],
         ["Bandwidth", fmtBandwidth(bps)],
+        ["Connections", String(tcpSessions.size + udpSessions.size)],
       ],
     ]);
   }, 1000);

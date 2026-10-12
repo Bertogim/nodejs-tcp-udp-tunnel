@@ -1,7 +1,7 @@
 // server.js
 
 // By Bertogim
-// v1.6.1
+// v1.6.2
 
 const net = require("net");
 const dgram = require("dgram");
@@ -11,7 +11,7 @@ const path = require("path");
 const readline = require('readline');
 const crypto = require('crypto');
 
-const VERSION = "1.6.1";
+const VERSION = "1.6.2";
 
 // TLS-PSK (no certificates needed) used for the worker control channel when
 // enabled. The key is derived from the token, so auth and encryption share the
@@ -629,6 +629,7 @@ async function main() {
       [
         ["PPs", String(pps)],
         ["Bandwidth", fmtBandwidth(bps)],
+        ["Connections", String(tcpSessions.size + udpClients.size)],
       ],
       [
         ["Connected", fmtList(active)],

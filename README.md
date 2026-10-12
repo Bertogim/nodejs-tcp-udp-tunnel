@@ -291,12 +291,12 @@ node client.js --version
 
 Both server and client print periodic statistics to the console:
 
-- **Server** (every 5 s): worker TCP/UDP status, paused TCP sessions, **packets/s (PPs)** and **bandwidth** of tunneled traffic, connected IP addresses, recent IPs (last 5 minutes), active session IPs.
-- **Client** (every 1 s): worker TCP/UDP status, number of active TCP/UDP sessions, **packets/s (PPs)** and **bandwidth** of tunneled traffic.
+- **Server** (every 5 s): worker TCP/UDP status, paused TCP sessions, **packets/s (PPs)**, **bandwidth** and current **Connections** (TCP + UDP flows) of tunneled traffic, connected IP addresses, recent IPs (last 5 minutes), active session IPs.
+- **Client** (every 1 s): worker TCP/UDP status, number of active TCP/UDP sessions, **packets/s (PPs)**, **bandwidth** and current **Connections** (TCP + UDP sessions) of tunneled traffic.
 
 PPs and bandwidth are sampled once per tick from plain counters (an increment per packet), so they add no per-packet work and no measurable overhead to the forwarding path.
 
-In a terminal the stats are shown as a **pinned status block** at the bottom while event logs scroll above it (colored, no full‑screen clears). The block lays out the metrics and the IP lists as **side‑by‑side columns** with at least 4 blank characters between them; when the terminal is wide enough it uses **three columns** (worker state | PPs/bandwidth | IP lists on the server; tunnel/worker | sessions | PPs/bandwidth on the client), falling back to two (or one) columns on narrower terminals. Each column truncates its values with `…` to its own share of the terminal width, so long IP lists never wrap or push the metrics out of view.
+In a terminal the stats are shown as a **pinned status block** at the bottom while event logs scroll above it (colored, no full‑screen clears). The block lays out the metrics and the IP lists as **side‑by‑side columns** with at least 4 blank characters between them; when the terminal is wide enough it uses **three columns** (worker state | PPs/bandwidth/Connections | IP lists on the server; tunnel/worker | sessions | PPs/bandwidth/Connections on the client), falling back to two (or one) columns on narrower terminals. Each column truncates its values with `…` to its own share of the terminal width, so long IP lists never wrap or push the metrics out of view.
 
 When output is not a terminal (piped or run as a service) the client prints plain, greppable lines and stats are emitted only every 30 seconds (tunable with `STATS_INTERVAL_MS`). Statistics are console‑only and are not written to log files.
 
