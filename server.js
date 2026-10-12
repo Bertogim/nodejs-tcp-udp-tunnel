@@ -1,7 +1,7 @@
 // server.js
 
 // By Bertogim
-// v1.5.1
+// v1.6.0
 
 const net = require("net");
 const dgram = require("dgram");
@@ -11,7 +11,7 @@ const path = require("path");
 const readline = require('readline');
 const crypto = require('crypto');
 
-const VERSION = "1.5.1";
+const VERSION = "1.6.0";
 
 // TLS-PSK (no certificates needed) used for the worker control channel when
 // enabled. The key is derived from the token, so auth and encryption share the
@@ -160,9 +160,34 @@ function fmtEvent(msg) {
 
 const ui = (() => {
   let drawn = 0;
-  let lastRows = [];
+  let lastRows = null;   // one-column layout ([label, value] pairs)
+  let lastCols = null;   // multi-column layout (array of row-groups)
   let lastNonTtyAt = 0;
   const width = () => _out.columns || 100;
+  const vlen = (s) => _useColor ? String(s).replace(/\x1b\[[0-9;]*m/g, "").length : String(s).length;
+  const vpad = (s, n) => { const pad = n - vlen(s); return pad > 0 ? s + " ".repeat(pad) : s; };
+
+  // Truncates a (possibly colored) string to `max` visible characters while
+  // keeping ANSI sequences intact; the caller appends the ellipsis.
+  function truncVis(s, max) {
+    const re = /\x1b\[[0-9;]*m/g;
+    let out = "";
+    let vis = 0;
+    let last = 0;
+    while (vis < max) {
+      const m = re.exec(s);
+      const end = m ? m.index : s.length;
+      const plain = s.slice(last, end);
+      const need = max - vis;
+      if (plain.length >= need) { out += plain.slice(0, need); break; }
+      out += plain;
+      vis += plain.length;
+      if (!m) break;
+      out += m[0];
+      last = re.lastIndex;
+    }
+    return out;
+  }
 
   function clear() {
     if (!_isTTY || drawn === 0) return;
@@ -174,10 +199,38 @@ const ui = (() => {
     const lines = rows.map(([k, v]) => {
       let val = String(v);
       const room = Math.max(0, width() - labelWidth - 2);
-      if (val.length > room) val = val.slice(0, Math.max(0, room - 1)) + "…";
+      if (vlen(val) > room) val = truncVis(val, Math.max(0, room - 1)) + "…";
       const label = paint(C.cyan, k + ":") + " ".repeat(labelWidth - (k.length + 1));
       return label + " " + val;
     });
+    _out.write(lines.join("\n") + "\n");
+    drawn = lines.length;
+  }
+  // Renders groups of [label, value] rows as side-by-side independent columns
+  // (e.g. traffic metrics next to the IP lists), each truncated to its own
+  // share of the terminal width.
+  function drawCols(groups) {
+    const gap = 2;
+    const total = Math.max(24, width());
+    const n = groups.length || 1;
+    const colWidth = Math.max(14, Math.floor((total - gap * (n - 1)) / n));
+    const cols = groups.map((rows) => {
+      const labelWidth = rows.reduce((m, [k]) => Math.max(m, k.length + 1), 0);
+      return rows.map(([k, v]) => {
+        let val = String(v);
+        const room = Math.max(0, colWidth - labelWidth - 2);
+        if (vlen(val) > room) val = truncVis(val, Math.max(0, room - 1)) + "…";
+        const label = paint(C.cyan, k + ":") + " ".repeat(labelWidth - (k.length + 1));
+        return vpad(label + " " + val, colWidth);
+      });
+    });
+    const maxRows = Math.max(1, ...groups.map((g) => g.length));
+    const lines = [];
+    for (let i = 0; i < maxRows; i++) {
+      const row = [];
+      for (let c = 0; c < cols.length; c++) row.push(cols[c][i] || " ".repeat(colWidth));
+      lines.push(row.join(" ".repeat(gap)));
+    }
     _out.write(lines.join("\n") + "\n");
     drawn = lines.length;
   }
@@ -194,15 +247,28 @@ const ui = (() => {
       if (!_isTTY) { _out.write(line + "\n"); return; }
       clear();
       _out.write(line + "\n");
-      if (lastRows.length) drawRows(lastRows);
+      if (lastCols) drawCols(lastCols);
+      else if (lastRows) drawRows(lastRows);
     },
     status(rows) {
+      lastCols = null;
       lastRows = rows;
       if (_isTTY) { clear(); drawRows(rows); return; }
       const now = Date.now();
       if (now - lastNonTtyAt < STATS_INTERVAL_MS) return;
       lastNonTtyAt = now;
       _out.write("[stats] " + rows.map(([k, v]) => `${k}=${v}`).join(" ") + "\n");
+    },
+    statusCols(groups) {
+      lastRows = null;
+      lastCols = groups;
+      if (_isTTY) { clear(); drawCols(groups); return; }
+      const now = Date.now();
+      if (now - lastNonTtyAt < STATS_INTERVAL_MS) return;
+      lastNonTtyAt = now;
+      const flat = [];
+      for (const g of groups) flat.push(...g);
+      _out.write("[stats] " + flat.map(([k, v]) => `${k}=${v}`).join(" ") + "\n");
     },
     banner(title, subtitle) {
       if (!_isTTY) return;
@@ -544,15 +610,19 @@ async function main() {
 
     const paused = Array.from(tcpSessions.values()).filter(session => session.paused).length;
 
-    ui.status([
-      ["Worker TCP", workerConnected ? ui.good("YES") : ui.bad("NO")],
-      ["Worker UDP", workerUdpEndpoint ? ui.good("YES") : ui.bad("NO")],
-      ["Paused TCP", String(paused)],
-      ["PPs", String(pps)],
-      ["Bandwidth", fmtBandwidth(bps)],
-      ["Connected", fmtList(active)],
-      ["Recent 5min", fmtList(recentIPs)],
-      ["Sessions", fmtList(sessionIPs)],
+    ui.statusCols([
+      [
+        ["Worker TCP", workerConnected ? ui.good("YES") : ui.bad("NO")],
+        ["Worker UDP", workerUdpEndpoint ? ui.good("YES") : ui.bad("NO")],
+        ["Paused TCP", String(paused)],
+        ["PPs", String(pps)],
+        ["Bandwidth", fmtBandwidth(bps)],
+      ],
+      [
+        ["Connected", fmtList(active)],
+        ["Recent 5min", fmtList(recentIPs)],
+        ["Sessions", fmtList(sessionIPs)],
+      ],
     ]);
     if (sessionIPs.size > MAX_SESSION_IPS) sessionIPs.clear();
   }, 5000));

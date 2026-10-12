@@ -296,7 +296,9 @@ Both server and client print periodic statistics to the console:
 
 PPs and bandwidth are sampled once per tick from plain counters (an increment per packet), so they add no per-packet work and no measurable overhead to the forwarding path.
 
-In a terminal the stats are shown as a **pinned status block** at the bottom while event logs scroll above it (colored, no full‑screen clears). When output is not a terminal (piped or run as a service) the client prints plain, greppable lines and stats are emitted only every 30 seconds (tunable with `STATS_INTERVAL_MS`). Statistics are console‑only and are not written to log files.
+In a terminal the stats are shown as a **pinned status block** at the bottom while event logs scroll above it (colored, no full‑screen clears). The block is split into two side‑by‑side columns: the traffic/number metrics on the left (server: worker TCP/UDP, paused TCP, PPs, bandwidth; client: tunnel, worker TCP/UDP, TCP/UDP sessions) and the per‑traffic columns on the right (server: connected, recent and session IPs; client: PPs, bandwidth). Each column truncates its values with `…` to its own share of the terminal width, so long IP lists never wrap or push the metrics out of view.
+
+When output is not a terminal (piped or run as a service) the client prints plain, greppable lines and stats are emitted only every 30 seconds (tunable with `STATS_INTERVAL_MS`). Statistics are console‑only and are not written to log files.
 
 ---
 
