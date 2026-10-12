@@ -208,6 +208,33 @@ When the blacklist is active the server logs `IP blacklist active: N entries fro
 
 ---
 
+## IP Privacy in Logs (showip / hideip)
+
+By default both the server and the client **mask the last 2 octets** of every IP address they print, so log files and consoles never leak full visitor/source addresses:
+
+```
+IPv4  203.0.113.10:51234  ->  203.0.xxx.xxx:51234
+IPv6  2001:db8::1:51234   ->  2001:db8::xxxx:51234   (last 16 bits masked)
+```
+
+- Log lines are also kept **within the terminal width** — long IP lists in the stats block are truncated with `…` instead of wrapping.
+- **`showip`** reveals full addresses; **`hideip`** masks them again.
+- The choice persists to **`ip-settings.json`** next to the script (`{ "ipMode": "show" | "hide" }`), so a restart keeps your last choice. The file is written once you toggle; the default (hide) never creates it.
+
+You can switch the mode in three ways (all equivalent):
+
+| How | Example |
+|-----|---------|
+| CLI flag | `node server.js 8080 --showip` (persisted) |
+| Environment | `SHOW_IP=1 node server.js` or `HIDE_IP=1 node client.js` |
+| Live stdin command | write `showip` / `hideip` + Enter to the process stdin (Pterodactyl console) |
+
+On startup the current mode is logged: `[*] IP display: hideip (last 2 octets masked in logs)` or `[*] IP display: showip (full addresses in logs)`, and toggling at runtime prints the same line so you can confirm the switch took effect.
+
+> The server's own bind address (`BIND_HOST`/`--bind`, e.g. `0.0.0.0`) is kept verbatim — it is your public configuration, not a third‑party address.
+
+---
+
 ## Graceful Shutdown (Pterodactyl-compatible)
 
 Both processes shut down cleanly on `SIGINT` (Ctrl‑C), `SIGTERM`, `SIGHUP` and `SIGQUIT`, and also when:
@@ -236,6 +263,8 @@ Server (`node server.js [port] [options]`):
 | `--bind <ip>` | Address to listen on (default `0.0.0.0`) |
 | `--tls` | Require TLS‑PSK on the worker control connection |
 | `--blacklist <file>` | Load IP/CIDR blacklist entries from a file |
+| `--showip` | Show full IP addresses in logs (saved to `ip-settings.json`) |
+| `--hideip` | Mask the last 2 octets of IPs again (default, saved to `ip-settings.json`) |
 | `--log-dir <path>` | Directory for log files (default `server-logs/`) |
 | `--no-log` | Disable file logging |
 | `-h, --help` | Show help and exit |
@@ -246,6 +275,8 @@ Client (`node client.js [config.json] [options]`):
 | Flag | Description |
 |------|-------------|
 | `--tls` | Encrypt the worker control connection (server must use `--tls`) |
+| `--showip` | Show full IP addresses in logs (saved to `ip-settings.json`) |
+| `--hideip` | Mask the last 2 octets of IPs again (default, saved to `ip-settings.json`) |
 | `--log-dir <path>` | Directory for log files (default `worker-logs/`) |
 | `--no-log` | Disable file logging |
 | `-h, --help` | Show help and exit |
@@ -264,10 +295,12 @@ node client.js --version
 
 Both server and client print periodic statistics to the console:
 
-- **Server** (every 5 s): worker TCP/UDP status, paused TCP sessions, connected IP addresses, recent IPs (last 5 minutes), active session IPs.
-- **Client** (every 1 s): worker TCP/UDP status, number of active TCP/UDP sessions.
+- **Server** (every 5 s): worker TCP/UDP status, paused TCP sessions, **packets/s (PPs)** and **bandwidth** of tunneled traffic, connected IP addresses, recent IPs (last 5 minutes), active session IPs.
+- **Client** (every 1 s): worker TCP/UDP status, number of active TCP/UDP sessions, **packets/s (PPs)** and **bandwidth** of tunneled traffic.
 
-In a terminal the stats are shown as a **pinned status block** at the bottom while event logs scroll above it (colored, no full‑screen clears). When output is not a terminal (piped or run as a service) the client prints plain, greppable lines and stats are emitted only every 30 seconds. Statistics are console‑only and are not written to log files.
+PPs and bandwidth are sampled once per tick from plain counters (an increment per packet), so they add no per-packet work and no measurable overhead to the forwarding path.
+
+In a terminal the stats are shown as a **pinned status block** at the bottom while event logs scroll above it (colored, no full‑screen clears). When output is not a terminal (piped or run as a service) the client prints plain, greppable lines and stats are emitted only every 30 seconds (tunable with `STATS_INTERVAL_MS`). Statistics are console‑only and are not written to log files.
 
 ---
 
@@ -299,7 +332,7 @@ NO_LOG=1 node client.js /path/to/config.json
 The test suite spins up a real `server.js` + `client.js` + local origin service on loopback ports and checks behaviour end to end. It needs `git` (used to fetch the `v1.0.0` baseline for the regression test) and is Linux/macOS only (memory/CPU sampling reads `/proc`). No dev dependencies are required.
 
 ```bash
-npm test        # full correctness suite (9 suites, see below)
+npm test        # full correctness suite (10 suites, see below)
 npm run bench   # throughput + CPU benchmark (tune with N_READERS, DURATION_MS)
 ```
 
@@ -315,6 +348,7 @@ npm run test:auth         # wrong token is rejected; incomplete handshake times 
 npm run test:ratelimit    # per-IP connection rate limit drops excess connections
 npm run test:tls          # TLS control channel: works end-to-end, plaintext/wrong-token rejected
 npm run test:blacklist    # IP blacklist: single IP + CIDR blocked on TCP and UDP
+npm run test:privacy      # IP display privacy (hideip default, showip/hideip, persistence) + PPs/Bandwidth stats
 ```
 
 The `test:regression` suite is the sensitivity check: it runs the pre-optimization `v1.0.0` server and expects it to stall a fast client while another client is paused. If that ever stops failing, the isolation guarantee has regressed.
@@ -351,6 +385,8 @@ The `test:regression` suite is the sensitivity check: it runs the pre-optimizati
 | `TLS` / `TLS_ENABLED` | Set to `1`/`true` to require TLS‑PSK on the control channel (also `--tls`) | (disabled) |
 | `IP_BLACKLIST` | Inline IP/CIDR blacklist entries, comma/`;`/newline separated | (none) |
 | `BLACKLIST_FILE` | Load IP/CIDR blacklist entries from a file (also `--blacklist`) | (none) |
+| `SHOW_IP` / `HIDE_IP` | Set `SHOW_IP=1` to reveal full IPs, `HIDE_IP=1` to mask the last 2 octets (also `--showip`/`--hideip`; persisted to `ip-settings.json`) | `hide` (masked) |
+| `STATS_INTERVAL_MS` | Min interval between `[stats]` lines when output is not a TTY | `30000` (30 s) |
 | `LOG_DIR`      | Directory for log files (also `--log-dir`) | `server-logs/` |
 | `NO_LOG`       | Set to `1` to disable file logging (also `--no-log`) | (enabled) |
 | `CLIENT_SOCKET_HIGH_WATERMARK` | Write buffer threshold (bytes) for public client sockets before backpressure kicks in | `262144` (256 KB) |
@@ -371,6 +407,8 @@ The `test:regression` suite is the sensitivity check: it runs the pre-optimizati
 | Variable       | Description                           | Default |
 |----------------|---------------------------------------|---------|
 | `TLS` / `TLS_ENABLED` | Set to `1`/`true` to encrypt the control channel (also `--tls` or `tls.enabled` in config) | (disabled) |
+| `SHOW_IP` / `HIDE_IP` | Set `SHOW_IP=1` to reveal full IPs, `HIDE_IP=1` to mask the last 2 octets (also `--showip`/`--hideip`; persisted to `ip-settings.json`) | `hide` (masked) |
+| `STATS_INTERVAL_MS` | Min interval between `[stats]` lines when output is not a TTY | `30000` (30 s) |
 | `LOG_DIR`      | Directory for log files (also `--log-dir`) | `worker-logs/` |
 | `NO_LOG`       | Set to `1` to disable file logging (also `--no-log`) | (enabled) |
 | `UDP_SESSION_TIMEOUT_MS` | Idle timeout for per‑source UDP sessions. Active flows refresh on every packet, so game traffic is never evicted | `60000` (60 s) |

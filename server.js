@@ -1,7 +1,7 @@
 // server.js
 
 // By Bertogim
-// v1.4.0
+// v1.5.0
 
 const net = require("net");
 const dgram = require("dgram");
@@ -11,7 +11,7 @@ const path = require("path");
 const readline = require('readline');
 const crypto = require('crypto');
 
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 
 // TLS-PSK (no certificates needed) used for the worker control channel when
 // enabled. The key is derived from the token, so auth and encryption share the
@@ -24,7 +24,7 @@ const TLS_CIPHERS = "PSK-AES256-GCM-SHA384:PSK-AES128-GCM-SHA256:PSK-CHACHA20-PO
 // Usage: node server.js [port] [--log-dir <path>] [--no-log] [--tls]
 //        [--blacklist <file>] [--bind <ip>]
 function parseArgs(argv) {
-  const opts = { positional: [], logDir: null, noLog: false, version: false, help: false, tls: false, blacklist: null, bind: null };
+  const opts = { positional: [], logDir: null, noLog: false, version: false, help: false, tls: false, blacklist: null, bind: null, showIp: false, hideIp: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--no-log" || a === "--no-logs") opts.noLog = true;
@@ -36,6 +36,8 @@ function parseArgs(argv) {
     else if (a.startsWith("--blacklist=")) opts.blacklist = a.slice("--blacklist=".length);
     else if (a === "--bind") opts.bind = argv[++i] || null;
     else if (a.startsWith("--bind=")) opts.bind = a.slice("--bind=".length);
+    else if (a === "--showip" || a === "--show-ip") opts.showIp = true;
+    else if (a === "--hideip" || a === "--hide-ip") opts.hideIp = true;
     else if (a === "--version" || a === "-v") opts.version = true;
     else if (a === "--help" || a === "-h") opts.help = true;
     else opts.positional.push(a);
@@ -43,6 +45,59 @@ function parseArgs(argv) {
   return opts;
 }
 const ARGS = parseArgs(process.argv.slice(2));
+
+// --- IP display privacy (default: mask the last 2 octets in logs) ---
+// Logs show IPv4 as a.b.xxx.xxx and IPv6 with the last 16 bits masked.
+// `showip` reveals full addresses, `hideip` masks them again; the choice can be
+// set with --showip/--hideip, SHOW_IP/HIDE_IP, a live stdin command, and it
+// persists to ip-settings.json next to this file.
+const IP_SETTINGS_FILE = path.join(__dirname, "ip-settings.json");
+const IP_FLAG_TRUE = /^(1|true|yes|on)$/i;
+
+function loadIpMode() {
+  if (ARGS.showIp) return "show";
+  if (ARGS.hideIp) return "hide";
+  if (IP_FLAG_TRUE.test(process.env.SHOW_IP || "")) return "show";
+  if (IP_FLAG_TRUE.test(process.env.HIDE_IP || "")) return "hide";
+  try {
+    const parsed = JSON.parse(fs.readFileSync(IP_SETTINGS_FILE, "utf8"));
+    if (parsed && parsed.ipMode === "show") return "show";
+  } catch { }
+  return "hide";
+}
+
+let ipMode = loadIpMode();
+
+function saveIpMode() {
+  try { fs.writeFileSync(IP_SETTINGS_FILE, JSON.stringify({ ipMode }, null, 2)); } catch { }
+}
+
+function setIpMode(mode) {
+  if (mode !== "show" && mode !== "hide") return;
+  ipMode = mode;
+  saveIpMode();
+  console.log(`[*] IP display: ${mode === "show" ? "showip (full addresses in logs)" : "hideip (last 2 octets masked in logs)"}`);
+}
+
+// Masks the last 2 octets (IPv6: last 16 bits = final hextet) of an IP.
+function maskIP(ip) {
+  let s = String(ip || "");
+  if (s.startsWith("::ffff:")) s = s.slice(7); // IPv4-mapped IPv6 -> plain IPv4
+  const m4 = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m4) return `${m4[1]}.${m4[2]}.xxx.xxx`;
+  if (s.indexOf(":") !== -1) {
+    const i = s.lastIndexOf(":");
+    if (i > 0) return s.slice(0, i) + ":xxxx";
+  }
+  return s;
+}
+
+function displayIP(ip) { return ipMode === "show" ? String(ip) : maskIP(ip); }
+function displayAddr(ip, port) {
+  const shown = displayIP(ip);
+  if (port === undefined || port === null || port === "") return shown;
+  return shown + ":" + port;
+}
 
 // --- Logging (optional and configurable) ---
 // Disable with --no-log (or NO_LOG=1); change the directory with --log-dir <path> (or LOG_DIR).
@@ -85,6 +140,7 @@ function ensureLogStream() {
 const _out = process.stdout;
 const _isTTY = _out.isTTY === true;
 const _useColor = _isTTY && !process.env.NO_COLOR;
+const STATS_INTERVAL_MS = parseInt(process.env.STATS_INTERVAL_MS || "30000", 10);
 const C = {
   reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
   red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m",
@@ -127,7 +183,14 @@ const ui = (() => {
   }
   return {
     log(msg) {
-      const line = fmtEvent(msg);
+      let m = String(msg);
+      // Keep what is painted to the terminal within the terminal width
+      // (long IP lists should never wrap). Files/log lines keep full length.
+      if (_isTTY) {
+        const bodyMax = Math.max(1, width() - (_useColor ? 9 : 0)); // reserve HH:MM:SS + space
+        if (m.length > bodyMax) m = m.slice(0, Math.max(1, bodyMax - 1)) + "…";
+      }
+      const line = fmtEvent(m);
       if (!_isTTY) { _out.write(line + "\n"); return; }
       clear();
       _out.write(line + "\n");
@@ -137,7 +200,7 @@ const ui = (() => {
       lastRows = rows;
       if (_isTTY) { clear(); drawRows(rows); return; }
       const now = Date.now();
-      if (now - lastNonTtyAt < 30000) return;
+      if (now - lastNonTtyAt < STATS_INTERVAL_MS) return;
       lastNonTtyAt = now;
       _out.write("[stats] " + rows.map(([k, v]) => `${k}=${v}`).join(" ") + "\n");
     },
@@ -175,13 +238,15 @@ Options:
   --tls                Require TLS-PSK on the worker control connection
                        (the client must enable tls in its config)
   --blacklist <file>   Load IP/CIDR blacklist entries from a file
+  --showip             Show full IP addresses in logs (saved to ip-settings.json)
+  --hideip             Mask the last 2 octets of IPs again (default, saved to ip-settings.json)
   --log-dir <path>     Directory for log files (default server-logs/)
   --no-log             Disable file logging
   -h, --help           Show this help and exit
   -v, --version        Show version and exit
 
 Environment: SERVER_PORT/PORT, BIND_HOST, TLS=1, IP_BLACKLIST, BLACKLIST_FILE,
-  LOG_DIR, NO_LOG, MAX_CONNECTIONS, CONN_RATE_LIMIT_PER_IP and more (see README).`);
+  SHOW_IP/HIDE_IP, LOG_DIR, NO_LOG, MAX_CONNECTIONS, CONN_RATE_LIMIT_PER_IP and more (see README).`);
 }
 
 // --- IP blacklist (CIDR-aware, IPv4 + IPv6) ---
@@ -342,6 +407,10 @@ async function main() {
 
   ui.banner(`nodejs-tcp-udp-tunnel v${VERSION}`, "server");
   console.log(NO_LOG ? "[*] Logging disabled" : `[*] Logging to ${LOG_DIR}`);
+  console.log(ipMode === "show"
+    ? "[*] IP display: showip (full addresses in logs)"
+    : "[*] IP display: hideip (last 2 octets masked in logs)");
+  if (ARGS.showIp || ARGS.hideIp) saveIpMode(); // persist an explicit CLI choice
   let detectedPort = getPort();
   if (!detectedPort) {
     detectedPort = await requestManualPort();
@@ -411,6 +480,11 @@ async function main() {
   let stats = { connections: 0, errors: 0 };
   let totalQueuedBytes = 0;
 
+  // --- Cheap traffic counters (O(1) per packet: just an increment). Rates are
+  // sampled once per stats tick, so they never touch the hot path. ---
+  let traffic = { packets: 0, bytes: 0 };
+  const countTraffic = (bytes) => { traffic.packets++; traffic.bytes += bytes; };
+
   let recentConnections = new Map();
   let sessionIPs = new Set();
 
@@ -426,14 +500,27 @@ async function main() {
 
   // --- Stats loop ---
   const fmtList = (iterable) => {
-    const list = Array.from(iterable).sort();
+    const list = Array.from(iterable).map(displayIP).sort();
     const shown = list.slice(0, 30);
     return shown.join(" ") + (list.length > shown.length ? ` +${list.length - shown.length}` : "");
   };
+  const fmtBandwidth = (bps) => {
+    if (bps >= 1024 * 1024) return (bps / (1024 * 1024)).toFixed(1) + " MB/s";
+    if (bps >= 1024) return (bps / 1024).toFixed(1) + " KB/s";
+    return Math.round(bps) + " B/s";
+  };
+  let lastTrafficSampleAt = Date.now();
 
   trackInterval(setInterval(() => {
     const now = Date.now();
     const active = new Set();
+
+    // Sample per-tick packet/bandwidth rates and reset the counters.
+    const elapsed = (now - lastTrafficSampleAt) / 1000;
+    lastTrafficSampleAt = now;
+    let pps = 0, bps = 0;
+    if (elapsed > 0) { pps = Math.round(traffic.packets / elapsed); bps = traffic.bytes / elapsed; }
+    traffic = { packets: 0, bytes: 0 };
 
     for (const session of tcpSessions.values()) {
       const sock = session.socket;
@@ -461,6 +548,8 @@ async function main() {
       ["Worker TCP", workerConnected ? ui.good("YES") : ui.bad("NO")],
       ["Worker UDP", workerUdpEndpoint ? ui.good("YES") : ui.bad("NO")],
       ["Paused TCP", String(paused)],
+      ["PPs", String(pps)],
+      ["Bandwidth", fmtBandwidth(bps)],
       ["Connected", fmtList(active)],
       ["Recent 5min", fmtList(recentIPs)],
       ["Sessions", fmtList(sessionIPs)],
@@ -690,6 +779,7 @@ async function main() {
         if (!session) return;
         const sock = session.socket;
         if (!sock || sock.destroyed) return;
+        countTraffic(data.length);
         sock.lastActivityAt = Date.now();
 
         // If the session is paused due to flow control, enqueue data
@@ -750,9 +840,10 @@ async function main() {
         const payload = data.subarray(nullIdx + 1);
         const entry = udpClients.get(srcKey);
         if (!entry) return;
+        countTraffic(payload.length);
         entry.lastSeen = Date.now();
         udpServer.send(payload, entry.port, entry.address, (err) => {
-          if (err) console.log(`[-] UDP send error to ${entry.address}:${entry.port}: ${err.message}`);
+          if (err) console.log(`[-] UDP send error to ${displayAddr(entry.address, entry.port)}: ${err.message}`);
         });
         return;
       }
@@ -764,7 +855,7 @@ async function main() {
   // --- Worker connection ---
   function handleWorkerConnection(sock, firstChunk) {
     let authenticated = false;
-    const clientAddr = sock.remoteAddress + ':' + sock.remotePort;
+    const clientAddr = displayAddr(sock.remoteAddress, sock.remotePort);
     const clientIp = sock.remoteAddress;
     stats.connections++;
 
@@ -924,6 +1015,7 @@ async function main() {
     sock.on("data", (chunk) => {
       if (worker && !worker.destroyed && workerConnected) {
         sock.lastActivityAt = Date.now();
+        countTraffic(chunk.length);
         // If the worker cannot keep up, stop reading from this client so the
         // worker's write queue cannot grow without bound.
         if (!sendToWorker(MSG_TYPE.TCP_DATA, sid, chunk) && !sock.isPaused()) {
@@ -988,6 +1080,7 @@ async function main() {
     entry.lastSeen = Date.now();
 
     if (!workerConnected) return;
+    countTraffic(msg.length);
 
     const packet = buildUdpInMessage(srcKey, msg);
     if (workerUdpEndpoint) {
@@ -1015,9 +1108,10 @@ async function main() {
     const payload = msg.subarray(nullIdx + 1, dataStart + dataLen);
     const entry = udpClients.get(srcKey);
     if (!entry) return;
+    countTraffic(payload.length);
     entry.lastSeen = Date.now();
     udpServer.send(payload, entry.port, entry.address, (err) => {
-      if (err) console.log(`[-] UDP send error to ${entry.address}:${entry.port}: ${err.message}`);
+      if (err) console.log(`[-] UDP send error to ${displayAddr(entry.address, entry.port)}: ${err.message}`);
     });
   }
 
@@ -1043,14 +1137,14 @@ async function main() {
   }, (sock) => {
     if (isBlacklisted(sock.remoteAddress)) {
       stats.errors++;
-      logThrottled(sock.remoteAddress, `[-] ${sock.remoteAddress}: blocked by IP blacklist`);
+      logThrottled(sock.remoteAddress, `[-] ${displayAddr(sock.remoteAddress, sock.remotePort)}: blocked by IP blacklist`);
       sock.on('error', () => {});
       sock.destroy();
       return;
     }
     if (!allowRate(tcpRateLimit, sock.remoteAddress, CONN_RATE_LIMIT_PER_IP)) {
       stats.errors++;
-      logThrottled(sock.remoteAddress, `[-] ${sock.remoteAddress}: TCP connection rate limit exceeded`);
+      logThrottled(sock.remoteAddress, `[-] ${displayAddr(sock.remoteAddress, sock.remotePort)}: TCP connection rate limit exceeded`);
       sock.on('error', () => {});
       sock.destroy();
       return;
@@ -1085,7 +1179,7 @@ async function main() {
         // attempt: drop it instead of forwarding it to the local service.
         if (isWorkerHandshakeChunk(firstChunk)) {
           stats.errors++;
-          logThrottled(sock.remoteAddress, `[-] ${sock.remoteAddress}: plaintext worker rejected (TLS required)`);
+          logThrottled(sock.remoteAddress, `[-] ${displayAddr(sock.remoteAddress, sock.remotePort)}: plaintext worker rejected (TLS required)`);
           sock.on('error', () => {});
           sock.destroy();
           return;
@@ -1202,10 +1296,13 @@ async function main() {
   });
 
   // A command-based Pterodactyl stop writes e.g. "stop" to the process stdin.
+  // "showip"/"hideip" switch the IP display mode live (and persist it).
   if (process.stdin && !process.stdin.destroyed) {
     process.stdin.on("data", (d) => {
       const line = d.toString().trim().toLowerCase();
       if (["stop", "exit", "quit", "shutdown", "end"].includes(line)) shutdown("stdin", 0);
+      else if (line === "showip") setIpMode("show");
+      else if (line === "hideip") setIpMode("hide");
     });
     process.stdin.on("end", () => shutdown("stdin-eof", 0));
     try { process.stdin.resume(); } catch { }

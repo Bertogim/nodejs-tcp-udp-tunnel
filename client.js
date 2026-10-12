@@ -1,7 +1,7 @@
 // client.js
 
 // By Bertogim
-// v1.4.0
+// v1.5.0
 
 const net = require("net");
 const dgram = require("dgram");
@@ -11,7 +11,7 @@ const path = require("path");
 const readline = require("readline");
 const crypto = require("crypto");
 
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 
 // TLS-PSK on the worker control channel (no certificates required). The key is
 // derived from the same token the server uses, so it must match on both ends.
@@ -22,7 +22,7 @@ const TLS_CIPHERS = "PSK-AES256-GCM-SHA384:PSK-AES128-GCM-SHA256:PSK-CHACHA20-PO
 // --- CLI arguments ---
 // Usage: node client.js [config.json] [--tls] [--log-dir <path>] [--no-log]
 function parseArgs(argv) {
-  const opts = { positional: [], logDir: null, noLog: false, version: false, help: false, tls: false };
+  const opts = { positional: [], logDir: null, noLog: false, version: false, help: false, tls: false, showIp: false, hideIp: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--no-log" || a === "--no-logs") opts.noLog = true;
@@ -30,6 +30,8 @@ function parseArgs(argv) {
     else if (a.startsWith("--log-dir=")) opts.logDir = a.slice("--log-dir=".length);
     else if (a === "--tls") opts.tls = true;
     else if (a === "--no-tls") opts.tls = false;
+    else if (a === "--showip" || a === "--show-ip") opts.showIp = true;
+    else if (a === "--hideip" || a === "--hide-ip") opts.hideIp = true;
     else if (a === "--version" || a === "-v") opts.version = true;
     else if (a === "--help" || a === "-h") opts.help = true;
     else opts.positional.push(a);
@@ -37,6 +39,62 @@ function parseArgs(argv) {
   return opts;
 }
 const ARGS = parseArgs(process.argv.slice(2));
+
+// --- IP display privacy (default: mask the last 2 octets in logs) ---
+// The choice can be set with --showip/--hideip, SHOW_IP/HIDE_IP, a live stdin
+// command, and it persists to ip-settings.json next to this file.
+const IP_SETTINGS_FILE = path.join(__dirname, "ip-settings.json");
+const IP_FLAG_TRUE = /^(1|true|yes|on)$/i;
+
+function loadIpMode() {
+  if (ARGS.showIp) return "show";
+  if (ARGS.hideIp) return "hide";
+  if (IP_FLAG_TRUE.test(process.env.SHOW_IP || "")) return "show";
+  if (IP_FLAG_TRUE.test(process.env.HIDE_IP || "")) return "hide";
+  try {
+    const parsed = JSON.parse(fs.readFileSync(IP_SETTINGS_FILE, "utf8"));
+    if (parsed && parsed.ipMode === "show") return "show";
+  } catch { }
+  return "hide";
+}
+
+let ipMode = loadIpMode();
+
+function saveIpMode() {
+  try { fs.writeFileSync(IP_SETTINGS_FILE, JSON.stringify({ ipMode }, null, 2)); } catch { }
+}
+
+function setIpMode(mode) {
+  if (mode !== "show" && mode !== "hide") return;
+  ipMode = mode;
+  saveIpMode();
+  console.log(`[*] IP display: ${mode === "show" ? "showip (full addresses in logs)" : "hideip (last 2 octets masked in logs)"}`);
+}
+
+function maskIP(ip) {
+  let s = String(ip || "");
+  if (s.startsWith("::ffff:")) s = s.slice(7); // IPv4-mapped IPv6 -> plain IPv4
+  const m4 = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m4) return `${m4[1]}.${m4[2]}.xxx.xxx`;
+  if (s.indexOf(":") !== -1) {
+    const i = s.lastIndexOf(":");
+    if (i > 0) return s.slice(0, i) + ":xxxx";
+  }
+  return s;
+}
+
+function displayIP(ip) { return ipMode === "show" ? String(ip) : maskIP(ip); }
+function displayAddr(ip, port) {
+  const shown = displayIP(ip);
+  if (port === undefined || port === null || port === "") return shown;
+  return shown + ":" + port;
+}
+// Masks "ip:port" session keys (the source endpoint of a remote client).
+function displayKey(key) {
+  const m = String(key).match(/^(.*):(\d{1,5})$/);
+  if (!m) return displayIP(key);
+  return displayIP(m[1]) + ":" + m[2];
+}
 
 // --- Logging (optional and configurable) ---
 // Disable with --no-log (or NO_LOG=1); change the directory with --log-dir <path> (or LOG_DIR).
@@ -79,6 +137,7 @@ function ensureLogStream() {
 const _out = process.stdout;
 const _isTTY = _out.isTTY === true;
 const _useColor = _isTTY && !process.env.NO_COLOR;
+const STATS_INTERVAL_MS = parseInt(process.env.STATS_INTERVAL_MS || "30000", 10);
 const C = {
   reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
   red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m",
@@ -121,7 +180,14 @@ const ui = (() => {
   }
   return {
     log(msg) {
-      const line = fmtEvent(msg);
+      let m = String(msg);
+      // Keep what is painted to the terminal within the terminal width
+      // (long IP lists should never wrap). Files/log lines keep full length.
+      if (_isTTY) {
+        const bodyMax = Math.max(1, width() - (_useColor ? 9 : 0)); // reserve HH:MM:SS + space
+        if (m.length > bodyMax) m = m.slice(0, Math.max(1, bodyMax - 1)) + "…";
+      }
+      const line = fmtEvent(m);
       if (!_isTTY) { _out.write(line + "\n"); return; }
       clear();
       _out.write(line + "\n");
@@ -131,7 +197,7 @@ const ui = (() => {
       lastRows = rows;
       if (_isTTY) { clear(); drawRows(rows); return; }
       const now = Date.now();
-      if (now - lastNonTtyAt < 30000) return;
+      if (now - lastNonTtyAt < STATS_INTERVAL_MS) return;
       lastNonTtyAt = now;
       _out.write("[stats] " + rows.map(([k, v]) => `${k}=${v}`).join(" ") + "\n");
     },
@@ -166,12 +232,14 @@ Usage: node client.js [config.json] [options]
 
 Options:
   --tls                Encrypt the worker control connection (server must use --tls)
+  --showip             Show full IP addresses in logs (saved to ip-settings.json)
+  --hideip             Mask the last 2 octets of IPs again (default, saved to ip-settings.json)
   --log-dir <path>     Directory for log files (default worker-logs/)
   --no-log             Disable file logging
   -h, --help           Show this help and exit
   -v, --version        Show version and exit
 
-Environment: TLS=1, NO_LOG, LOG_DIR, UDP_SESSION_TIMEOUT_MS, MAX_UDP_SESSIONS.`);
+Environment: TLS=1, SHOW_IP/HIDE_IP, NO_LOG, LOG_DIR, UDP_SESSION_TIMEOUT_MS, MAX_UDP_SESSIONS.`);
 }
 
 // --- Graceful shutdown (Pterodactyl-friendly: SIGTERM/SIGINT or stdin command) ---
@@ -219,6 +287,17 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
 
   const localIntervals = [];
   const every = (fn, ms) => { const id = setInterval(fn, ms); localIntervals.push(id); return id; };
+
+  // --- Cheap traffic counters (O(1) per packet: just an increment). Rates are
+  // sampled once per stats tick, so they never touch the hot path. ---
+  let traffic = { packets: 0, bytes: 0 };
+  const countTraffic = (bytes) => { traffic.packets++; traffic.bytes += bytes; };
+  let lastTrafficAt = Date.now();
+  const fmtBandwidth = (bps) => {
+    if (bps >= 1024 * 1024) return (bps / (1024 * 1024)).toFixed(1) + " MB/s";
+    if (bps >= 1024) return (bps / 1024).toFixed(1) + " KB/s";
+    return Math.round(bps) + " B/s";
+  };
 
   // Message types
   const MSG_TYPE = {
@@ -286,12 +365,21 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
     const workerTcpStatus = (control && !control.destroyed && controlAuthenticated) ? "YES" : "NO";
     const workerUdpStatus = (udpControl && !udpControl.destroyed && udpControlAuthenticated) ? "YES" : "NO";
 
+    const now = Date.now();
+    const elapsed = (now - lastTrafficAt) / 1000;
+    lastTrafficAt = now;
+    let pps = 0, bps = 0;
+    if (elapsed > 0) { pps = Math.round(traffic.packets / elapsed); bps = traffic.bytes / elapsed; }
+    traffic = { packets: 0, bytes: 0 };
+
     ui.status([
       ["Tunnel", VPS_NAME],
       ["Worker TCP", ui[(workerTcpStatus === "YES") ? "good" : "bad"](workerTcpStatus)],
       ["Worker UDP", ui[(workerUdpStatus === "YES") ? "good" : "bad"](workerUdpStatus)],
       ["TCP sessions", String(tcpSessions.size)],
       ["UDP sessions", String(udpSessions.size)],
+      ["PPs", String(pps)],
+      ["Bandwidth", fmtBandwidth(bps)],
     ]);
   }, 1000);
 
@@ -500,6 +588,7 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
     });
 
     sock.on("data", (chunk) => {
+      countTraffic(chunk.length);
       const ok = sendMessage(MSG_TYPE.TCP_DATA, sid, chunk);
       if (!ok && !pausedLocalSockets.has(sock)) {
         sock.pause();
@@ -577,6 +666,7 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
     }
 
     if (s.ready) {
+      countTraffic(data.length);
       const canWrite = s.socket.write(data);
       if (!canWrite && !s.writeBlocked) {
         s.writeBlocked = true;
@@ -630,6 +720,7 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
     });
 
     sock.on("data", (chunk) => {
+      countTraffic(chunk.length);
       const ok = sendMessage(MSG_TYPE.TCP_DATA, sid, chunk);
       if (!ok && !pausedLocalSockets.has(sock)) {
         sock.pause();
@@ -688,11 +779,12 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
     const state = { socket: sock, ready: false, pending: [], lastSeen: Date.now() };
 
     sock.on("error", (err) => {
-      console.log(`[-] UDP session ${srcKey} error: ${err.message}`);
+      console.log(`[-] UDP session ${displayKey(srcKey)} error: ${err.message}`);
       try { sock.close(); } catch { }
     });
 
     sock.on("message", (msg) => {
+      countTraffic(msg.length);
       const srcKeyBuf = Buffer.from(srcKey);
       const data = Buffer.concat([srcKeyBuf, Buffer.from([0]), msg]);
       if (!udpControlAuthenticated || !sendUdpTunnelMessage(MSG_TYPE.UDP_OUT, 0, data)) {
@@ -700,16 +792,16 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
       }
     });
 
-    console.log(`[*] UDP session ${srcKey} creating local socket to ${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT}`);
+    console.log(`[*] UDP session ${displayKey(srcKey)} creating local socket to ${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT}`);
     sock.connect(LOCAL_UDP_PORT, LOCAL_UDP_HOST, () => {
       state.ready = true;
-      console.log(`[*] UDP session ${srcKey} connected to local ${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT}`);
+      console.log(`[*] UDP session ${displayKey(srcKey)} connected to local ${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT}`);
       for (const buf of state.pending) {
         sock.send(buf, (err) => {
           if (err) {
-            console.log(`[-] UDP session ${srcKey} send error: ${err.message}`);
+            console.log(`[-] UDP session ${displayKey(srcKey)} send error: ${err.message}`);
           } else {
-            console.log(`[*] UDP session ${srcKey} flushed ${buf.length} bytes pending`);
+            console.log(`[*] UDP session ${displayKey(srcKey)} flushed ${buf.length} bytes pending`);
           }
         });
       }
@@ -771,11 +863,12 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
         if (nullIdx === -1) return;
         const srcKey = data.slice(0, nullIdx).toString();
         const payload = data.slice(nullIdx + 1);
+        countTraffic(payload.length);
 
         const s = getUdpSession(srcKey);
         if (s.ready) {
           s.socket.send(payload, (err) => {
-            if (err) console.log(`[-] UDP send error for ${srcKey}: ${err.message}`);
+            if (err) console.log(`[-] UDP send error for ${displayKey(srcKey)}: ${err.message}`);
           });
         } else {
           s.pending.push(payload);
@@ -833,11 +926,12 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
       if (nullIdx === -1) return;
       const srcKey = data.slice(0, nullIdx).toString();
       const payload = data.slice(nullIdx + 1);
+      countTraffic(payload.length);
 
       const s = getUdpSession(srcKey);
       if (s.ready) {
         s.socket.send(payload, (err) => {
-          if (err) console.log(`[-] UDP send error for ${srcKey}: ${err.message}`);
+          if (err) console.log(`[-] UDP send error for ${displayKey(srcKey)}: ${err.message}`);
         });
       } else {
         s.pending.push(payload);
@@ -1062,6 +1156,10 @@ async function main() {
   const TLS_FROM_ENV = ARGS.tls || /^(1|true|yes|on)$/i.test(process.env.TLS || process.env.TLS_ENABLED || "");
   ui.banner(`nodejs-tcp-udp-tunnel v${VERSION}`, "worker client");
   console.log(NO_LOG ? "[*] Logging disabled" : `[*] Logging to ${LOG_DIR}`);
+  console.log(ipMode === "show"
+    ? "[*] IP display: showip (full addresses in logs)"
+    : "[*] IP display: hideip (last 2 octets masked in logs)");
+  if (ARGS.showIp || ARGS.hideIp) saveIpMode(); // persist an explicit CLI choice
 
   config.forEach(c => {
     const vpsData = parseSocket(c.vps.socket, "VPS SOCKET");
@@ -1080,10 +1178,13 @@ async function main() {
   });
 
   // Pterodactyl may stop a server by writing a command to its stdin.
+  // "showip"/"hideip" switch the IP display mode live (and persist it).
   if (process.stdin && !process.stdin.destroyed) {
     process.stdin.on("data", (d) => {
       const line = d.toString().trim().toLowerCase();
       if (["stop", "exit", "quit", "shutdown", "end"].includes(line)) shutdown("stdin", 0);
+      else if (line === "showip") setIpMode("show");
+      else if (line === "hideip") setIpMode("hide");
     });
     process.stdin.on("end", () => shutdown("stdin-eof", 0));
     try { process.stdin.resume(); } catch { }
