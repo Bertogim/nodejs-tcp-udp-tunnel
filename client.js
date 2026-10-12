@@ -1,7 +1,7 @@
 // client.js
 
 // By Bertogim
-// v1.6.0
+// v1.6.1
 
 const net = require("net");
 const dgram = require("dgram");
@@ -11,7 +11,7 @@ const path = require("path");
 const readline = require("readline");
 const crypto = require("crypto");
 
-const VERSION = "1.6.0";
+const VERSION = "1.6.1";
 
 // TLS-PSK on the worker control channel (no certificates required). The key is
 // derived from the same token the server uses, so it must match on both ends.
@@ -203,15 +203,25 @@ const ui = (() => {
     _out.write(lines.join("\n") + "\n");
     drawn = lines.length;
   }
-  // Renders groups of [label, value] rows as side-by-side independent columns
-  // (e.g. traffic metrics next to the session lists), each truncated to its
-  // own share of the terminal width.
-  function drawCols(groups) {
-    const gap = 2;
+  // Renders row-groups (segments) as side-by-side columns. Uses as many
+  // columns as the terminal fits — up to one column per segment — with at
+  // least COL_GAP blank characters between columns; each column truncates its
+  // values to its own share of the terminal width.
+  const COL_GAP = 4;
+  const MIN_COL_WIDTH = 26;
+  function drawCols(segments) {
     const total = Math.max(24, width());
-    const n = groups.length || 1;
-    const colWidth = Math.max(14, Math.floor((total - gap * (n - 1)) / n));
-    const cols = groups.map((rows) => {
+    // Pick the column count: all segments if they fit, otherwise merge the
+    // leading segments and keep the trailing ones (traffic / IP lists) whole.
+    let k = segments.length;
+    while (k > 1 && total - COL_GAP * (k - 1) < k * MIN_COL_WIDTH) k--;
+    let cols;
+    if (k >= segments.length) cols = segments.map((g) => g.slice());
+    else if (k === 1) cols = [[].concat(...segments)];
+    else cols = [[].concat(...segments.slice(0, segments.length - (k - 1)))].concat(
+      segments.slice(-(k - 1)).map((g) => g.slice()));
+    const colWidth = Math.max(14, Math.floor((total - COL_GAP * (cols.length - 1)) / cols.length));
+    const rendered = cols.map((rows) => {
       const labelWidth = rows.reduce((m, [k]) => Math.max(m, k.length + 1), 0);
       return rows.map(([k, v]) => {
         let val = String(v);
@@ -221,12 +231,12 @@ const ui = (() => {
         return vpad(label + " " + val, colWidth);
       });
     });
-    const maxRows = Math.max(1, ...groups.map((g) => g.length));
+    const maxRows = Math.max(1, ...cols.map((g) => g.length));
     const lines = [];
     for (let i = 0; i < maxRows; i++) {
       const row = [];
-      for (let c = 0; c < cols.length; c++) row.push(cols[c][i] || " ".repeat(colWidth));
-      lines.push(row.join(" ".repeat(gap)));
+      for (let c = 0; c < rendered.length; c++) row.push(rendered[c][i] || " ".repeat(colWidth));
+      lines.push(row.join(" ".repeat(COL_GAP)));
     }
     _out.write(lines.join("\n") + "\n");
     drawn = lines.length;
@@ -443,6 +453,8 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
         ["Tunnel", VPS_NAME],
         ["Worker TCP", ui[(workerTcpStatus === "YES") ? "good" : "bad"](workerTcpStatus)],
         ["Worker UDP", ui[(workerUdpStatus === "YES") ? "good" : "bad"](workerUdpStatus)],
+      ],
+      [
         ["TCP sessions", String(tcpSessions.size)],
         ["UDP sessions", String(udpSessions.size)],
       ],
