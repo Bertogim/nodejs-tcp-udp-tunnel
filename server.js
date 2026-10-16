@@ -1,10 +1,11 @@
 // server.js
 
 // By Bertogim
-// v1.0.0
+// v1.6.2
 
 const net = require("net");
 const dgram = require("dgram");
+const tls = require("tls");
 const fs = require("fs");
 const path = require("path");
 const readline = require('readline');
@@ -111,20 +112,93 @@ function createServerAddons(options) {
   };
 }
 
+const VERSION = "1.6.2";
+
+// TLS-PSK (no certificates needed) used for the worker control channel when
+// enabled. The key is derived from the token, so auth and encryption share the
+// same secret and no certificate files have to be deployed alongside.
+const TLS_MAGIC = Buffer.from("TUNS");
+const TLS_IDENTITY = "TUN1";
+const TLS_CIPHERS = "PSK-AES256-GCM-SHA384:PSK-AES128-GCM-SHA256:PSK-CHACHA20-POLY1305";
+
 // --- CLI arguments ---
-// Usage: node server.js [port] [--log-dir <path>] [--no-log]
+// Usage: node server.js [port] [--log-dir <path>] [--no-log] [--tls]
+//        [--blacklist <file>] [--bind <ip>]
 function parseArgs(argv) {
-  const opts = { positional: [], logDir: null, noLog: false };
+  const opts = { positional: [], logDir: null, noLog: false, version: false, help: false, tls: false, blacklist: null, bind: null, showIp: false, hideIp: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--no-log" || a === "--no-logs") opts.noLog = true;
     else if (a === "--log-dir") opts.logDir = argv[++i] || null;
     else if (a.startsWith("--log-dir=")) opts.logDir = a.slice("--log-dir=".length);
+    else if (a === "--tls") opts.tls = true;
+    else if (a === "--no-tls") opts.tls = false;
+    else if (a === "--blacklist") opts.blacklist = argv[++i] || null;
+    else if (a.startsWith("--blacklist=")) opts.blacklist = a.slice("--blacklist=".length);
+    else if (a === "--bind") opts.bind = argv[++i] || null;
+    else if (a.startsWith("--bind=")) opts.bind = a.slice("--bind=".length);
+    else if (a === "--showip" || a === "--show-ip") opts.showIp = true;
+    else if (a === "--hideip" || a === "--hide-ip") opts.hideIp = true;
+    else if (a === "--version" || a === "-v") opts.version = true;
+    else if (a === "--help" || a === "-h") opts.help = true;
     else opts.positional.push(a);
   }
   return opts;
 }
 const ARGS = parseArgs(process.argv.slice(2));
+
+// --- IP display privacy (default: mask the last 2 octets in logs) ---
+// Logs show IPv4 as a.b.xxx.xxx and IPv6 with the last 16 bits masked.
+// `showip` reveals full addresses, `hideip` masks them again; the choice can be
+// set with --showip/--hideip, SHOW_IP/HIDE_IP, a live stdin command, and it
+// persists to ip-settings.json next to this file.
+const IP_SETTINGS_FILE = path.join(__dirname, "ip-settings.json");
+const IP_FLAG_TRUE = /^(1|true|yes|on)$/i;
+
+function loadIpMode() {
+  if (ARGS.showIp) return "show";
+  if (ARGS.hideIp) return "hide";
+  if (IP_FLAG_TRUE.test(process.env.SHOW_IP || "")) return "show";
+  if (IP_FLAG_TRUE.test(process.env.HIDE_IP || "")) return "hide";
+  try {
+    const parsed = JSON.parse(fs.readFileSync(IP_SETTINGS_FILE, "utf8"));
+    if (parsed && parsed.ipMode === "show") return "show";
+  } catch { }
+  return "hide";
+}
+
+let ipMode = loadIpMode();
+
+function saveIpMode() {
+  try { fs.writeFileSync(IP_SETTINGS_FILE, JSON.stringify({ ipMode }, null, 2)); } catch { }
+}
+
+function setIpMode(mode) {
+  if (mode !== "show" && mode !== "hide") return;
+  ipMode = mode;
+  saveIpMode();
+  console.log(`[*] IP display: ${mode === "show" ? "showip (full addresses in logs)" : "hideip (last 2 octets masked in logs)"}`);
+}
+
+// Masks the last 2 octets (IPv6: last 16 bits = final hextet) of an IP.
+function maskIP(ip) {
+  let s = String(ip || "");
+  if (s.startsWith("::ffff:")) s = s.slice(7); // IPv4-mapped IPv6 -> plain IPv4
+  const m4 = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m4) return `${m4[1]}.${m4[2]}.xxx.xxx`;
+  if (s.indexOf(":") !== -1) {
+    const i = s.lastIndexOf(":");
+    if (i > 0) return s.slice(0, i) + ":xxxx";
+  }
+  return s;
+}
+
+function displayIP(ip) { return ipMode === "show" ? String(ip) : maskIP(ip); }
+function displayAddr(ip, port) {
+  const shown = displayIP(ip);
+  if (port === undefined || port === null || port === "") return shown;
+  return shown + ":" + port;
+}
 
 // --- Logging (optional and configurable) ---
 // Disable with --no-log (or NO_LOG=1); change the directory with --log-dir <path> (or LOG_DIR).
@@ -144,6 +218,7 @@ const getLogFileName = () => {
 
 let logFilePath = null;
 let logStream = null;
+let logClosed = false;
 
 const originalLog = console.log;
 
@@ -166,6 +241,7 @@ function ensureLogStream() {
 const _out = process.stdout;
 const _isTTY = _out.isTTY === true;
 const _useColor = _isTTY && !process.env.NO_COLOR;
+const STATS_INTERVAL_MS = parseInt(process.env.STATS_INTERVAL_MS || "30000", 10);
 const C = {
   reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
   red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m",
@@ -185,9 +261,34 @@ function fmtEvent(msg) {
 
 const ui = (() => {
   let drawn = 0;
-  let lastRows = [];
+  let lastRows = null;   // one-column layout ([label, value] pairs)
+  let lastCols = null;   // multi-column layout (array of row-groups)
   let lastNonTtyAt = 0;
   const width = () => _out.columns || 100;
+  const vlen = (s) => _useColor ? String(s).replace(/\x1b\[[0-9;]*m/g, "").length : String(s).length;
+  const vpad = (s, n) => { const pad = n - vlen(s); return pad > 0 ? s + " ".repeat(pad) : s; };
+
+  // Truncates a (possibly colored) string to `max` visible characters while
+  // keeping ANSI sequences intact; the caller appends the ellipsis.
+  function truncVis(s, max) {
+    const re = /\x1b\[[0-9;]*m/g;
+    let out = "";
+    let vis = 0;
+    let last = 0;
+    while (vis < max) {
+      const m = re.exec(s);
+      const end = m ? m.index : s.length;
+      const plain = s.slice(last, end);
+      const need = max - vis;
+      if (plain.length >= need) { out += plain.slice(0, need); break; }
+      out += plain;
+      vis += plain.length;
+      if (!m) break;
+      out += m[0];
+      last = re.lastIndex;
+    }
+    return out;
+  }
 
   function clear() {
     if (!_isTTY || drawn === 0) return;
@@ -199,28 +300,86 @@ const ui = (() => {
     const lines = rows.map(([k, v]) => {
       let val = String(v);
       const room = Math.max(0, width() - labelWidth - 2);
-      if (val.length > room) val = val.slice(0, Math.max(0, room - 1)) + "…";
+      if (vlen(val) > room) val = truncVis(val, Math.max(0, room - 1)) + "…";
       const label = paint(C.cyan, k + ":") + " ".repeat(labelWidth - (k.length + 1));
       return label + " " + val;
     });
     _out.write(lines.join("\n") + "\n");
     drawn = lines.length;
   }
+  // Renders row-groups (segments) as side-by-side columns. Uses as many
+  // columns as the terminal fits — up to one column per segment — with at
+  // least COL_GAP blank characters between columns; each column truncates its
+  // values to its own share of the terminal width.
+  const COL_GAP = 4;
+  const MIN_COL_WIDTH = 26;
+  function drawCols(segments) {
+    const total = Math.max(24, width());
+    // Pick the column count: all segments if they fit, otherwise merge the
+    // leading segments and keep the trailing ones (IP lists / traffic) whole.
+    let k = segments.length;
+    while (k > 1 && total - COL_GAP * (k - 1) < k * MIN_COL_WIDTH) k--;
+    let cols;
+    if (k >= segments.length) cols = segments.map((g) => g.slice());
+    else if (k === 1) cols = [[].concat(...segments)];
+    else cols = [[].concat(...segments.slice(0, segments.length - (k - 1)))].concat(
+      segments.slice(-(k - 1)).map((g) => g.slice()));
+    const colWidth = Math.max(14, Math.floor((total - COL_GAP * (cols.length - 1)) / cols.length));
+    const rendered = cols.map((rows) => {
+      const labelWidth = rows.reduce((m, [k]) => Math.max(m, k.length + 1), 0);
+      return rows.map(([k, v]) => {
+        let val = String(v);
+        const room = Math.max(0, colWidth - labelWidth - 2);
+        if (vlen(val) > room) val = truncVis(val, Math.max(0, room - 1)) + "…";
+        const label = paint(C.cyan, k + ":") + " ".repeat(labelWidth - (k.length + 1));
+        return vpad(label + " " + val, colWidth);
+      });
+    });
+    const maxRows = Math.max(1, ...cols.map((g) => g.length));
+    const lines = [];
+    for (let i = 0; i < maxRows; i++) {
+      const row = [];
+      for (let c = 0; c < rendered.length; c++) row.push(rendered[c][i] || " ".repeat(colWidth));
+      lines.push(row.join(" ".repeat(COL_GAP)));
+    }
+    _out.write(lines.join("\n") + "\n");
+    drawn = lines.length;
+  }
   return {
     log(msg) {
-      const line = fmtEvent(msg);
+      let m = String(msg);
+      // Keep what is painted to the terminal within the terminal width
+      // (long IP lists should never wrap). Files/log lines keep full length.
+      if (_isTTY) {
+        const bodyMax = Math.max(1, width() - (_useColor ? 9 : 0)); // reserve HH:MM:SS + space
+        if (m.length > bodyMax) m = m.slice(0, Math.max(1, bodyMax - 1)) + "…";
+      }
+      const line = fmtEvent(m);
       if (!_isTTY) { _out.write(line + "\n"); return; }
       clear();
       _out.write(line + "\n");
-      if (lastRows.length) drawRows(lastRows);
+      if (lastCols) drawCols(lastCols);
+      else if (lastRows) drawRows(lastRows);
     },
     status(rows) {
+      lastCols = null;
       lastRows = rows;
       if (_isTTY) { clear(); drawRows(rows); return; }
       const now = Date.now();
-      if (now - lastNonTtyAt < 30000) return;
+      if (now - lastNonTtyAt < STATS_INTERVAL_MS) return;
       lastNonTtyAt = now;
       _out.write("[stats] " + rows.map(([k, v]) => `${k}=${v}`).join(" ") + "\n");
+    },
+    statusCols(groups) {
+      lastRows = null;
+      lastCols = groups;
+      if (_isTTY) { clear(); drawCols(groups); return; }
+      const now = Date.now();
+      if (now - lastNonTtyAt < STATS_INTERVAL_MS) return;
+      lastNonTtyAt = now;
+      const flat = [];
+      for (const g of groups) flat.push(...g);
+      _out.write("[stats] " + flat.map(([k, v]) => `${k}=${v}`).join(" ") + "\n");
     },
     banner(title, subtitle) {
       if (!_isTTY) return;
@@ -238,12 +397,168 @@ const ui = (() => {
 
 console.log = function (...args) {
   const message = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
-  if (!NO_LOG) {
+  if (!NO_LOG && !logClosed) {
     ensureLogStream();
     logStream.write(`[${new Date().toISOString()}] ${message}\n`);
   }
   ui.log(message);
 };
+
+// --- CLI help ---
+function printHelp() {
+  originalLog.call(console, `nodejs-tcp-udp-tunnel server v${VERSION}
+
+Usage: node server.js [port] [options]
+
+Options:
+  --bind <ip>          Address to listen on (default 0.0.0.0)
+  --tls                Require TLS-PSK on the worker control connection
+                       (the client must enable tls in its config)
+  --blacklist <file>   Load IP/CIDR blacklist entries from a file
+  --showip             Show full IP addresses in logs (saved to ip-settings.json)
+  --hideip             Mask the last 2 octets of IPs again (default, saved to ip-settings.json)
+  --log-dir <path>     Directory for log files (default server-logs/)
+  --no-log             Disable file logging
+  -h, --help           Show this help and exit
+  -v, --version        Show version and exit
+
+Environment: SERVER_PORT/PORT, BIND_HOST, TLS=1, IP_BLACKLIST, BLACKLIST_FILE,
+  SHOW_IP/HIDE_IP, LOG_DIR, NO_LOG, MAX_CONNECTIONS, CONN_RATE_LIMIT_PER_IP and more (see README).`);
+}
+
+// --- IP blacklist (CIDR-aware, IPv4 + IPv6) ---
+// Every address is normalized to a 16-byte form (IPv4 is mapped as
+// ::ffff:a.b.c.d) so a single prefix match handles both families.
+let BLACKLIST = null;
+
+function normalizeIP(ip) {
+  const s = String(ip || "");
+  return s.startsWith("::ffff:") ? s.slice(7) : s;
+}
+
+function parseIPv4ToBytes(ip) {
+  const parts = String(ip).split(".");
+  if (parts.length !== 4) return null;
+  const out = Buffer.alloc(4);
+  for (let i = 0; i < 4; i++) {
+    if (!/^\d{1,3}$/.test(parts[i])) return null;
+    const n = Number(parts[i]);
+    if (n < 0 || n > 255) return null;
+    out[i] = n;
+  }
+  return out;
+}
+
+function parseIPv6ToBytes(ip) {
+  let str = String(ip);
+  const doubleIdx = str.indexOf("::");
+  if (str.indexOf("::", doubleIdx + 1) !== -1) return null;
+  const expand = (part) => {
+    const groups = [];
+    if (part === "") return groups;
+    for (const g of part.split(":")) {
+      if (g.includes(".")) {
+        const v4 = parseIPv4ToBytes(g);
+        if (!v4) return null;
+        groups.push(v4.readUInt16BE(0), v4.readUInt16BE(2));
+      } else {
+        if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+        groups.push(parseInt(g, 16));
+      }
+    }
+    return groups;
+  };
+  let groups;
+  if (doubleIdx === -1) {
+    groups = expand(str);
+    if (!groups || groups.length !== 8) return null;
+  } else {
+    const head = expand(str.slice(0, doubleIdx));
+    const tail = expand(str.slice(doubleIdx + 2));
+    if (!head || !tail) return null;
+    const fill = 8 - head.length - tail.length;
+    if (fill < 0) return null;
+    groups = head.concat(new Array(fill).fill(0), tail);
+  }
+  const out = Buffer.alloc(16);
+  for (let i = 0; i < 8; i++) out.writeUInt16BE(groups[i] & 0xffff, i * 2);
+  return out;
+}
+
+function ipTo16Bytes(ip) {
+  const norm = normalizeIP(ip);
+  const v4 = parseIPv4ToBytes(norm);
+  if (v4) return Buffer.concat([Buffer.alloc(10), Buffer.from([0xff, 0xff]), v4]);
+  return parseIPv6ToBytes(norm);
+}
+
+function prefixMask(prefix) {
+  const mask = Buffer.alloc(16);
+  for (let i = 0; i < 16; i++) {
+    const left = prefix - i * 8;
+    mask[i] = left >= 8 ? 0xff : left <= 0 ? 0x00 : (0xff << (8 - left)) & 0xff;
+  }
+  return mask;
+}
+
+function parseBlacklistEntry(text) {
+  const raw = String(text).trim();
+  if (!raw || raw.startsWith("#")) return null;
+  const [addr, prefixStr] = raw.split("/");
+  const v4 = parseIPv4ToBytes(addr);
+  let bytes, prefix;
+  if (v4) {
+    bytes = Buffer.concat([Buffer.alloc(10), Buffer.from([0xff, 0xff]), v4]);
+    prefix = 96 + (prefixStr === undefined ? 32 : Number(prefixStr));
+  } else {
+    const v6 = parseIPv6ToBytes(addr);
+    if (!v6) return null;
+    bytes = v6;
+    prefix = prefixStr === undefined ? 128 : Number(prefixStr);
+  }
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 128) return null;
+  return { base: bytes, mask: prefixMask(prefix), prefix };
+}
+
+function loadBlacklist() {
+  const entries = [];
+  const sources = [];
+  const seen = new Set();
+  const add = (text, source) => {
+    for (const line of String(text).split(/[\n,;]+/)) {
+      const entry = parseBlacklistEntry(line);
+      if (entry) {
+        const key = entry.base.toString("hex") + "/" + entry.prefix;
+        if (!seen.has(key)) { seen.add(key); entry.source = source; entries.push(entry); }
+      } else if (line.trim() && !line.trim().startsWith("#")) {
+        console.log(`[-] Ignoring invalid blacklist entry: "${line.trim()}"`);
+      }
+    }
+  };
+  const explicitFile = ARGS.blacklist || process.env.BLACKLIST_FILE;
+  const defaultFile = path.join(__dirname, "blacklist.txt");
+  const file = explicitFile || (fs.existsSync(defaultFile) ? defaultFile : null);
+  if (file) {
+    if (fs.existsSync(file)) { add(fs.readFileSync(file, "utf8"), file); sources.push(file); }
+    else console.log(`[-] Blacklist file not found: ${file}`);
+  }
+  if (process.env.IP_BLACKLIST) { add(process.env.IP_BLACKLIST, "IP_BLACKLIST"); sources.push("IP_BLACKLIST"); }
+  return { entries, sources };
+}
+
+function isBlacklisted(ip) {
+  if (!BLACKLIST || BLACKLIST.entries.length === 0) return false;
+  const bytes = ipTo16Bytes(ip);
+  if (!bytes) return false;
+  for (const e of BLACKLIST.entries) {
+    let match = true;
+    for (let i = 0; i < 16; i++) {
+      if ((bytes[i] & e.mask[i]) !== (e.base[i] & e.mask[i])) { match = false; break; }
+    }
+    if (match) return true;
+  }
+  return false;
+}
 
 // --- Token handling ---
 function getToken() {
@@ -264,8 +579,15 @@ function getToken() {
 }
 
 async function main() {
-  ui.banner("nodejs-tcp-udp-tunnel", "server");
+  if (ARGS.help) { printHelp(); process.exit(0); }
+  if (ARGS.version) { originalLog.call(console, VERSION); process.exit(0); }
+
+  ui.banner(`nodejs-tcp-udp-tunnel v${VERSION}`, "server");
   console.log(NO_LOG ? "[*] Logging disabled" : `[*] Logging to ${LOG_DIR}`);
+  console.log(ipMode === "show"
+    ? "[*] IP display: showip (full addresses in logs)"
+    : "[*] IP display: hideip (last 2 octets masked in logs)");
+  if (ARGS.showIp || ARGS.hideIp) saveIpMode(); // persist an explicit CLI choice
   let detectedPort = getPort();
   if (!detectedPort) {
     detectedPort = await requestManualPort();
@@ -273,6 +595,9 @@ async function main() {
 
   const PORT = detectedPort;
   const TOKEN = getToken();                    // ← token from file
+  BLACKLIST = loadBlacklist();
+  const TLS_ENABLED = ARGS.tls || /^(1|true|yes|on)$/i.test(process.env.TLS || process.env.TLS_ENABLED || "");
+  const BIND_HOST = ARGS.bind || process.env.BIND_HOST || "0.0.0.0";
   const BUFFER_SIZE = 256 * 1024;
   const MAX_PARSER_BUFFER = 1024 * 1024;      // 1 MB max parser buffer size
   const WORKER_HANDSHAKE_TIMEOUT_MS = 250;
@@ -315,6 +640,13 @@ async function main() {
   const TCP_AUTH_PAYLOAD = `TUN1 ${TOKEN}`;
   const UDP_AUTH_PAYLOAD = `${WORKER_UDP_AUTH_PREFIX} ${TOKEN}`;
 
+  console.log(TLS_ENABLED
+    ? "[*] Control TLS: ENABLED (TLS-PSK 1.2, key derived from the token)"
+    : "[*] Control TLS: disabled (start with --tls or TLS=1 to encrypt the control channel)");
+  if (BLACKLIST.entries.length > 0) {
+    console.log(`[*] IP blacklist active: ${BLACKLIST.entries.length} entr${BLACKLIST.entries.length === 1 ? "y" : "ies"} from ${BLACKLIST.sources.join(", ")}`);
+  }
+
   let worker = null;
   let workerUdpEndpoint = null;
   let workerConnected = false;
@@ -325,6 +657,11 @@ async function main() {
   let stats = { connections: 0, errors: 0 };
   let totalQueuedBytes = 0;
 
+  // --- Cheap traffic counters (O(1) per packet: just an increment). Rates are
+  // sampled once per stats tick, so they never touch the hot path. ---
+  let traffic = { packets: 0, bytes: 0 };
+  const countTraffic = (bytes) => { traffic.packets++; traffic.bytes += bytes; };
+
   let recentConnections = new Map();
   let sessionIPs = new Set();
 
@@ -332,16 +669,35 @@ async function main() {
   const udpRateLimit = new Map();   // ip -> { count, windowStart }
   const authFailLogAt = new Map();  // ip -> last log timestamp
 
+  // --- Graceful shutdown bookkeeping ---
+  const shutdownHooks = [];
+  let shuttingDown = false;
+  let exited = false;
+  const trackInterval = (id) => { shutdownHooks.push(() => clearInterval(id)); return id; };
+
   // --- Stats loop ---
   const fmtList = (iterable) => {
-    const list = Array.from(iterable).sort();
+    const list = Array.from(iterable).map(displayIP).sort();
     const shown = list.slice(0, 30);
     return shown.join(" ") + (list.length > shown.length ? ` +${list.length - shown.length}` : "");
   };
+  const fmtBandwidth = (bps) => {
+    if (bps >= 1024 * 1024) return (bps / (1024 * 1024)).toFixed(1) + " MB/s";
+    if (bps >= 1024) return (bps / 1024).toFixed(1) + " KB/s";
+    return Math.round(bps) + " B/s";
+  };
+  let lastTrafficSampleAt = Date.now();
 
-  setInterval(() => {
+  trackInterval(setInterval(() => {
     const now = Date.now();
     const active = new Set();
+
+    // Sample per-tick packet/bandwidth rates and reset the counters.
+    const elapsed = (now - lastTrafficSampleAt) / 1000;
+    lastTrafficSampleAt = now;
+    let pps = 0, bps = 0;
+    if (elapsed > 0) { pps = Math.round(traffic.packets / elapsed); bps = traffic.bytes / elapsed; }
+    traffic = { packets: 0, bytes: 0 };
 
     for (const session of tcpSessions.values()) {
       const sock = session.socket;
@@ -365,19 +721,28 @@ async function main() {
 
     const paused = Array.from(tcpSessions.values()).filter(session => session.paused).length;
 
-    ui.status([
-      ["Worker TCP", workerConnected ? ui.good("YES") : ui.bad("NO")],
-      ["Worker UDP", workerUdpEndpoint ? ui.good("YES") : ui.bad("NO")],
-      ["Paused TCP", String(paused)],
-      ["Connected", fmtList(active)],
-      ["Recent 5min", fmtList(recentIPs)],
-      ["Sessions", fmtList(sessionIPs)],
+    ui.statusCols([
+      [
+        ["Worker TCP", workerConnected ? ui.good("YES") : ui.bad("NO")],
+        ["Worker UDP", workerUdpEndpoint ? ui.good("YES") : ui.bad("NO")],
+        ["Paused TCP", String(paused)],
+      ],
+      [
+        ["PPs", String(pps)],
+        ["Bandwidth", fmtBandwidth(bps)],
+        ["Connections", String(tcpSessions.size + udpClients.size)],
+      ],
+      [
+        ["Connected", fmtList(active)],
+        ["Recent 5min", fmtList(recentIPs)],
+        ["Sessions", fmtList(sessionIPs)],
+      ],
     ]);
     if (sessionIPs.size > MAX_SESSION_IPS) sessionIPs.clear();
-  }, 5000);
+  }, 5000));
 
   const UDP_TIMEOUT = 60 * 1000;
-  setInterval(() => {
+  trackInterval(setInterval(() => {
     const now = Date.now();
     for (const [key, client] of udpClients.entries()) {
       if (now - client.lastSeen > UDP_TIMEOUT) udpClients.delete(key);
@@ -393,7 +758,7 @@ async function main() {
     for (const [ip, t] of authFailLogAt) {
       if (now - t > LOG_FAIL_THROTTLE_MS) authFailLogAt.delete(ip);
     }
-  }, 10000);
+  }, 10000));
 
   // --- Helper functions ---
   // Constant-time string compare for secrets (token). Falls back to false on
@@ -618,6 +983,7 @@ async function main() {
         if (!session) return;
         const sock = session.socket;
         if (!sock || sock.destroyed) return;
+        countTraffic(data.length);
         sock.lastActivityAt = Date.now();
 
         // If the session is paused due to flow control, enqueue data
@@ -678,9 +1044,10 @@ async function main() {
         const payload = data.subarray(nullIdx + 1);
         const entry = udpClients.get(srcKey);
         if (!entry) return;
+        countTraffic(payload.length);
         entry.lastSeen = Date.now();
         udpServer.send(payload, entry.port, entry.address, (err) => {
-          if (err) console.log(`[-] UDP send error to ${entry.address}:${entry.port}: ${err.message}`);
+          if (err) console.log(`[-] UDP send error to ${displayAddr(entry.address, entry.port)}: ${err.message}`);
         });
         return;
       }
@@ -692,7 +1059,7 @@ async function main() {
   // --- Worker connection ---
   function handleWorkerConnection(sock, firstChunk) {
     let authenticated = false;
-    const clientAddr = sock.remoteAddress + ':' + sock.remotePort;
+    const clientAddr = displayAddr(sock.remoteAddress, sock.remotePort);
     const clientIp = sock.remoteAddress;
     stats.connections++;
 
@@ -792,7 +1159,7 @@ async function main() {
       handleWorkerMessage(msg);
     });
 
-    parse(firstChunk);
+    if (firstChunk && firstChunk.length) parse(firstChunk);
     sock.on("data", parse);
   }
 
@@ -852,6 +1219,7 @@ async function main() {
     sock.on("data", (chunk) => {
       if (worker && !worker.destroyed && workerConnected) {
         sock.lastActivityAt = Date.now();
+        countTraffic(chunk.length);
         // If the worker cannot keep up, stop reading from this client so the
         // worker's write queue cannot grow without bound.
         if (!sendToWorker(MSG_TYPE.TCP_DATA, sid, chunk) && !sock.isPaused()) {
@@ -916,6 +1284,7 @@ async function main() {
     entry.lastSeen = Date.now();
 
     if (!workerConnected) return;
+    countTraffic(msg.length);
 
     const packet = buildUdpInMessage(srcKey, msg);
     if (workerUdpEndpoint) {
@@ -946,10 +1315,26 @@ async function main() {
     const payload = msg.subarray(nullIdx + 1, dataStart + dataLen);
     const entry = udpClients.get(srcKey);
     if (!entry) return;
+    countTraffic(payload.length);
     entry.lastSeen = Date.now();
     udpServer.send(payload, entry.port, entry.address, (err) => {
-      if (err) console.log(`[-] UDP send error to ${entry.address}:${entry.port}: ${err.message}`);
+      if (err) console.log(`[-] UDP send error to ${displayAddr(entry.address, entry.port)}: ${err.message}`);
     });
+  }
+
+  // --- TLS-PSK control server (only when enabled) ---
+  let tlsServer = null;
+  if (TLS_ENABLED) {
+    const psk = crypto.createHash("sha256").update(TOKEN).digest();
+    tlsServer = tls.createServer({
+      ciphers: TLS_CIPHERS,
+      minVersion: "TLSv1.2",
+      maxVersion: "TLSv1.2",
+      pskCallback: (socket, identity) => (identity === TLS_IDENTITY ? { psk, identity } : null),
+    }, (tlsSock) => {
+      handleWorkerConnection(tlsSock, null);
+    });
+    tlsServer.on("error", (err) => console.log(`[-] TLS server error: ${err.message}`));
   }
 
   // --- Servers ---
@@ -957,9 +1342,16 @@ async function main() {
     highWaterMark: CLIENT_SOCKET_HIGH_WATERMARK,
     pauseOnConnect: false
   }, (sock) => {
+    if (isBlacklisted(sock.remoteAddress)) {
+      stats.errors++;
+      logThrottled(sock.remoteAddress, `[-] ${displayAddr(sock.remoteAddress, sock.remotePort)}: blocked by IP blacklist`);
+      sock.on('error', () => {});
+      sock.destroy();
+      return;
+    }
     if (!allowRate(tcpRateLimit, sock.remoteAddress, CONN_RATE_LIMIT_PER_IP)) {
       stats.errors++;
-      logThrottled(sock.remoteAddress, `[-] ${sock.remoteAddress}: TCP connection rate limit exceeded`);
+      logThrottled(sock.remoteAddress, `[-] ${displayAddr(sock.remoteAddress, sock.remotePort)}: TCP connection rate limit exceeded`);
       sock.on('error', () => {});
       sock.destroy();
       return;
@@ -978,6 +1370,30 @@ async function main() {
       if (classified) return;
       clearTimeout(handshakeTimer);
       classified = true;
+
+      if (TLS_ENABLED) {
+        // Worker control connections start with a magic prefix followed by the
+        // TLS ClientHello. Feed the socket to the TLS server, keeping any bytes
+        // that arrived glued to the magic in the same packet.
+        if (firstChunk.length >= TLS_MAGIC.length && firstChunk.subarray(0, TLS_MAGIC.length).equals(TLS_MAGIC)) {
+          sock.pause();
+          const rest = firstChunk.subarray(TLS_MAGIC.length);
+          if (rest.length) sock.unshift(rest);
+          tlsServer.emit("connection", sock);
+          return;
+        }
+        // A plaintext worker handshake while TLS is required is a downgrade
+        // attempt: drop it instead of forwarding it to the local service.
+        if (isWorkerHandshakeChunk(firstChunk)) {
+          stats.errors++;
+          logThrottled(sock.remoteAddress, `[-] ${displayAddr(sock.remoteAddress, sock.remotePort)}: plaintext worker rejected (TLS required)`);
+          sock.on('error', () => {});
+          sock.destroy();
+          return;
+        }
+        handlePublicTcp(sock, firstChunk);
+        return;
+      }
 
       if (isWorkerHandshakeChunk(firstChunk)) {
         handleWorkerConnection(sock, firstChunk);
@@ -999,23 +1415,24 @@ async function main() {
 
   const udpServer = dgram.createSocket("udp4");
 
-  setInterval(() => {
+  trackInterval(setInterval(() => {
     if (!worker || worker.destroyed) return;
     if (Date.now() - (worker.lastHeartbeatAt || 0) > WORKER_HEARTBEAT_TIMEOUT_MS) {
       console.log("[-] worker heartbeat timed out, closing stale control socket");
       try { worker.destroy(); } catch { }
     }
-  }, 10_000);
+  }, 10_000));
 
-  setInterval(() => {
+  trackInterval(setInterval(() => {
     if (!workerUdpEndpoint) return;
     if (Date.now() - workerUdpEndpoint.lastSeen > WORKER_UDP_TIMEOUT_MS) {
       console.log("[-] worker UDP endpoint timed out");
       workerUdpEndpoint = null;
     }
-  }, 10_000);
+  }, 10_000));
 
   udpServer.on("message", (msg, rinfo) => {
+    if (isBlacklisted(rinfo.address)) return;
     if (addons.datagram(msg)) return;
     if (isWorkerAuthHello(msg)) {
       workerUdpEndpoint = {
@@ -1044,12 +1461,68 @@ async function main() {
     console.log(`[-] UDP server error: ${err.message}`);
   });
 
-  tcpServer.listen(PORT, "0.0.0.0", () => {
-    console.log(`[*] TCP listening on ${PORT}`);
+  // --- Graceful shutdown ---
+  // Compatible with Pterodactyl: Wings stops a server with SIGTERM (default)
+  // or SIGINT (egg stop command "^C"). Stopping never depends on stdin, because
+  // some hosts deliver an immediate stdin EOF at boot (which self-stopped it).
+  function shutdown(reason, code) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const finish = () => { if (exited) return; exited = true; process.exit(code || 0); };
+    console.log(`[*] Shutting down (${reason})...`);
+    logClosed = true;
+    for (const hook of shutdownHooks) { try { hook(); } catch { } }
+    try { tcpServer.close(); } catch { }
+    try { udpServer.close(); } catch { }
+    if (tlsServer) { try { tlsServer.close(); } catch { } }
+    for (const session of tcpSessions.values()) {
+      try { if (session.socket) session.socket.destroy(); } catch { }
+    }
+    tcpSessions.clear();
+    udpClients.clear();
+    if (worker) { try { worker.destroy(); } catch { } }
+    if (logStream && !logStream.destroyed) {
+      try { logStream.end(finish); } catch { finish(); }
+      setTimeout(finish, 1500);
+    } else {
+      finish();
+    }
+  }
+
+  const handleSignal = (sig) => () => shutdown(sig, 0);
+  process.on("SIGINT", handleSignal("SIGINT"));
+  process.on("SIGTERM", handleSignal("SIGTERM"));
+  process.on("SIGHUP", handleSignal("SIGHUP"));
+  process.on("SIGQUIT", handleSignal("SIGQUIT"));
+  process.on("uncaughtException", (err) => {
+    console.log(`[-] uncaughtException: ${err && err.stack ? err.stack : err}`);
+    shutdown("uncaughtException", 1);
+  });
+  process.on("unhandledRejection", (err) => {
+    console.log(`[-] unhandledRejection: ${err && err.stack ? err.stack : err}`);
+    shutdown("unhandledRejection", 1);
   });
 
-  udpServer.bind(PORT, "0.0.0.0", () => {
-    console.log(`[*] UDP listening on ${PORT}`);
+  // Stopping is handled exclusively by the signal handlers above (SIGINT/"^C"
+  // egg stop, SIGTERM from Wings). Nothing here reacts to stdin commands or
+  // EOF: some hosts (Wings included) deliver an immediate stdin EOF at boot,
+  // which used to stop the server by itself. stdin is only used for the live
+  // "showip"/"hideip" display toggles (persisted).
+  if (process.stdin && !process.stdin.destroyed) {
+    process.stdin.on("data", (d) => {
+      const line = d.toString().trim().toLowerCase();
+      if (line === "showip") setIpMode("show");
+      else if (line === "hideip") setIpMode("hide");
+    });
+    try { process.stdin.resume(); } catch { }
+  }
+
+  tcpServer.listen(PORT, BIND_HOST, () => {
+    console.log(`[*] TCP listening on ${BIND_HOST}:${PORT}`);
+  });
+
+  udpServer.bind(PORT, BIND_HOST, () => {
+    console.log(`[*] UDP listening on ${BIND_HOST}:${PORT}`);
     console.log(`[*] Server ready - Client socket highWaterMark: ${CLIENT_SOCKET_HIGH_WATERMARK / 1024}KB`);
   });
 }
