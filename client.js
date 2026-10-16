@@ -180,6 +180,102 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
   let udpHelloInterval = null;
   let lastHeartbeatAt = 0;
 
+  // Keep standalone operation when no addons are configured.
+  const addons = (process.env.TUNNEL_ADDONS || process.env.TUNNEL_ADDON_SOCKET)
+    ? (function () {
+      const module = { exports: {} };
+// Explicitly enabled, trusted local JavaScript addons. Not a security sandbox.
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const net = require('net');
+const MAX_DATA = 48 * 1024;
+module.exports = function createAddons(options) {
+  const handlers = new Map();
+  const validType = type => Number.isInteger(type) && type >= 0x80 && type <= 0xef;
+  const report = err => console.error('[addon] ' + (err && err.message || err));
+  function send(type, data, transport = 'tcp') {
+    if (!validType(type) || !Buffer.isBuffer(data) || data.length > MAX_DATA ||
+        !['tcp', 'udp'].includes(transport)) return false;
+    return options.send(type, data, transport);
+  }
+  function dispatch(msg, transport) {
+    if (!validType(msg.type)) return false;
+    const data = msg.data || Buffer.alloc(0);
+    if (data.length > MAX_DATA) return true;
+    const handler = handlers.get(msg.type);
+    if (handler) {
+      try {
+        Promise.resolve(handler(Buffer.from(data), {
+          role: options.role, transport, sid: msg.sid,
+          reply: payload => send(msg.type, payload, transport)
+        })).catch(report);
+      } catch (err) { report(err); }
+    }
+    return true; // Unknown addon messages never enter normal tunnel handlers.
+  }
+  const api = Object.freeze({
+    role: options.role, send,
+    onMessage(type, handler) {
+      if (!validType(type) || typeof handler !== 'function' || handlers.has(type))
+        throw new Error('Invalid or duplicate addon type: ' + type);
+      handlers.set(type, handler);
+    }
+  });
+  for (const filename of (process.env.TUNNEL_ADDONS || '').split(path.delimiter).filter(Boolean)) {
+    const setup = require(path.resolve(filename));
+    if (typeof setup !== 'function') throw new Error('Addon must export a setup function');
+    setup(api);
+  }
+  if (options.role === 'client' && process.env.TUNNEL_ADDON_SOCKET) {
+    const socketPath = path.resolve(process.env.TUNNEL_ADDON_SOCKET);
+    const bridge = net.createServer(sock => {
+      let pending = '';
+      let count = 0;
+      sock.setTimeout(2000, () => sock.destroy());
+      sock.on('error', report);
+      sock.on('data', chunk => {
+        pending += chunk.toString('utf8');
+        if (Buffer.byteLength(pending) > MAX_DATA * 2) return sock.destroy();
+        let end;
+        while ((end = pending.indexOf('\n')) >= 0) {
+          const line = pending.slice(0, end);
+          pending = pending.slice(end + 1);
+          if (++count > 32) return sock.destroy();
+          try {
+            const msg = JSON.parse(line);
+            const data = Buffer.from(JSON.stringify(msg.payload));
+            const ok = send(msg.type, data, msg.transport || 'tcp');
+            sock.write(JSON.stringify({ ok }) + '\n');
+          } catch (err) { report(err); sock.destroy(); return; }
+        }
+      });
+    });
+    bridge.maxConnections = 16;
+    bridge.on('error', report);
+    bridge.listen(socketPath, () => {
+      try { fs.chmodSync(socketPath, 0o600); }
+      catch (err) { report(err); bridge.close(); }
+    });
+    // Never unlink an existing path: another process may own it.
+  }
+  return { dispatch };
+};
+
+      return module.exports;
+    })()({
+      role: 'client',
+      send(type, data, transport) {
+      if (transport === 'udp') {
+        return udpControlAuthenticated && sendUdpTunnelMessage(type, 0, data);
+      }
+      if (!controlAuthenticated || !control || control.destroyed ||
+          control.writableLength > 256 * 1024) return false;
+      sendMessage(type, 0, data);
+      return true;
+      }
+    }) : { dispatch() { return false; } };
+
   // ---- Backpressure: local -> control ----
   const pausedLocalSockets = new Set();
 
@@ -615,6 +711,7 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
   }
 
   function handleServerMessage(msg) {
+    if (controlAuthenticated && addons.dispatch(msg, 'tcp')) return;
     try {
       const { type, sid, data } = msg;
 
@@ -708,6 +805,7 @@ function StartTunnel(VPS_NAME, TOKEN, VPS_IP, VPS_PORT, LOCAL_TCP_HOST, LOCAL_TC
   function handleUdpTunnelMessage(packet) {
     const msg = decodeSingleMessage(packet);
     if (!msg) return;
+    if (udpControlAuthenticated && addons.dispatch(msg, 'udp')) return;
 
     try {
       const { type, data } = msg;

@@ -191,6 +191,172 @@ NO_LOG=1 node client.js /path/to/config.json
 
 ---
 
+## Writing Addons
+
+Both programs include their addon loader. No separate loader file or npm
+package is required.
+
+Addons are **trusted JavaScript code**, not sandboxed plugins. They run with
+the same permissions as the process. Install only code you trust, keep handlers
+short, and avoid blocking filesystem operations or expensive work in handlers.
+
+### Install a server addon
+
+Create an `addons/` directory beside `server.js`:
+
+```text
+server.js
+token
+addons/
+  example.js
+```
+
+The server loads direct, regular `.js` files from this directory at startup,
+in filename order. Subdirectories and symbolic links are not automatically
+loaded. Restart after adding, editing or removing an addon.
+
+Keep your existing startup command and port:
+
+```bash
+node server.js 8080
+```
+
+A successfully loaded addon prints `[addon] loaded example.js`. A failed server
+addon is reported without stopping the tunnel; its pending registrations are
+discarded. Duplicate message types or datagram prefixes are rejected.
+
+### Addon module and framed-message API
+
+Export a synchronous setup function using CommonJS:
+
+```javascript
+// addons/example.js
+module.exports = function setup(api) {
+  api.onMessage(0x81, (data, context) => {
+    if (data.length > 1024) return;
+
+    if (api.role === 'server') {
+      context.reply(Buffer.from('Message received', 'utf8'));
+    } else {
+      console.log('[example] ' + data.toString('utf8'));
+    }
+  });
+};
+```
+
+The setup function registers handlers immediately. Do not make setup `async`.
+Message handlers may return promises; rejected handler promises are reported.
+
+- `api.role`: `"server"` or `"client"`.
+- `api.onMessage(type, handler)`: register a handler for a framed addon message.
+  Types **`0x80` through `0xef`** are reserved for addons. Choose an unused type
+  and use the same type on both ends.
+- `api.send(type, buffer, transport)`: send a `Buffer` through the authenticated
+  worker connection. Transport is `"tcp"` by default or `"udp"`.
+- `context.transport`: incoming transport, `"tcp"` or `"udp"`.
+- `context.sid`: incoming frame session ID. The addon send API uses session ID
+  zero; it does not open a normal forwarded session.
+- `context.reply(buffer)`: reply using the same message type and transport.
+  Replies go to the connected worker/server, not an arbitrary public client.
+
+Framed addon payloads are limited to **48 KiB**. Unknown addon message types
+are consumed without entering the normal tunnel handlers.
+
+A `false` send result means the send was not accepted, for example because
+the connection is unavailable, authentication is incomplete, or the TCP queue
+is congested. A `true` result is **not** an application-level acknowledgement.
+There is no persistent retry queue. TCP provides ordered delivery while connected;
+UDP may lose, duplicate or reorder packets.
+
+These messages reuse tunnel authentication. They do **not** add encryption.
+
+### Enable an addon on the client
+
+Unlike the server, the client does not automatically scan `addons/`.
+Enable its addon files explicitly:
+
+```bash
+TUNNEL_ADDONS=./addons/example.js node client.js
+```
+
+Paths are resolved relative to the working directory. Multiple paths use the
+platform path delimiter, `:` on Linux:
+
+```bash
+TUNNEL_ADDONS=./addons/example.js:./addons/another.js node client.js
+```
+
+The server also accepts `TUNNEL_ADDONS` in addition to its automatic directory
+scan. Avoid loading the same addon twice through different paths.
+
+To send a periodic example message, save this as a separate client addon:
+
+```javascript
+// addons/sender.js
+module.exports = function setup(api) {
+  if (api.role !== 'client') return;
+
+  const timer = setInterval(() => {
+    // Sending can return false before authentication or during disconnection.
+    api.send(0x81, Buffer.from('Hello from an addon', 'utf8'), 'tcp');
+  }, 10000);
+
+  timer.unref();
+};
+```
+
+Enable both client files:
+
+```bash
+TUNNEL_ADDONS=./addons/example.js:./addons/sender.js node client.js
+```
+
+The server's `example.js` replies to type `0x81`; the client's `example.js`
+prints that reply. The client sender does not register a second handler for
+the same type.
+
+Client addon setup errors can stop client startup. Test addons before deploying.
+
+### Receive standalone UDP messages on the server
+
+Server addons can also register a separate UDP message format, without requiring
+a tunnel worker:
+
+```javascript
+// addons/datagram-validator.js
+module.exports = function setup(api) {
+  if (api.role !== 'server') return;
+
+  api.onDatagram('APPMSG01', payload => {
+    // The eight-byte prefix has already been removed.
+    // This example deliberately accepts no messages:
+    // implement and verify authentication before processing payload.
+    return;
+  });
+};
+```
+
+`api.onDatagram(prefix, handler)` is **server-only**:
+
+- The prefix must be exactly eight uppercase ASCII letters or digits.
+- The packet format is `[8-byte prefix][addon-defined payload]`.
+- The entire packet, including its prefix, must not exceed **49,152 bytes**.
+- Matching packets are routed to the addon before normal UDP forwarding.
+- A matching packet is consumed even if the handler rejects or ignores it.
+- The handler receives only the payload, not a reply function or sender address.
+
+**A prefix is routing, not authentication.** These standalone packets bypass
+worker authentication. Before accepting them, implement authentication,
+replay protection, payload validation, resource limits and an appropriate
+confidentiality strategy. Do not expose an unauthenticated file-writing,
+command-execution or forwarding handler.
+
+Use a unique prefix that will not collide with traffic forwarded by the tunnel.
+The datagram API does not provide automatic replies, delivery confirmation,
+encryption or retries.
+
+---
+
 ## Testing
 
 The test suite spins up a real `server.js` + `client.js` + local origin service on loopback ports and checks behaviour end to end. It needs `git` (used to fetch the `v1.0.0` baseline for the regression test) and is Linux/macOS only (memory/CPU sampling reads `/proc`). No dev dependencies are required.

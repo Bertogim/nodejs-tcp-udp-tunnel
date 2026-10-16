@@ -10,6 +10,107 @@ const path = require("path");
 const readline = require('readline');
 const crypto = require('crypto');
 
+
+// Addons are trusted local code, not sandboxed. Restart after adding/removing one.
+function createServerAddons(options) {
+  const MAX_DATA = 48 * 1024;
+  const handlers = new Map();
+  const datagrams = new Map();
+  const validType = type => Number.isInteger(type) && type >= 0x80 && type <= 0xef;
+  const report = err => console.error('[addon] ' + (err && err.message || err));
+  function send(type, data, transport = 'tcp') {
+    if (!validType(type) || !Buffer.isBuffer(data) || data.length > MAX_DATA ||
+        !['tcp', 'udp'].includes(transport)) return false;
+    try { return options.send(type, data, transport); }
+    catch (err) { report(err); return false; }
+  }
+  const directory = path.join(__dirname, 'addons');
+  const files = new Set();
+  try {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.isFile() && entry.name.endsWith('.js')) {
+        files.add(path.join(directory, entry.name));
+      }
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') report(err);
+  }
+  // Preserve compatibility with explicitly configured addon paths.
+  for (const file of (process.env.TUNNEL_ADDONS || '')
+    .split(path.delimiter).filter(Boolean)) files.add(path.resolve(file));
+
+  for (const file of files) {
+    const pending = new Map();
+    const pendingDatagrams = new Map();
+    let loading = true;
+    try {
+      const setup = require(file);
+      if (typeof setup !== 'function' || setup.constructor.name === 'AsyncFunction') {
+        throw new Error('Addon must export a synchronous setup function');
+      }
+      const api = Object.freeze({
+        role: 'server',
+        send,
+        onDatagram(prefix, handler) {
+          if (!loading || typeof prefix !== 'string' ||
+              !/^[A-Z0-9]{8}$/.test(prefix) || typeof handler !== 'function' ||
+              datagrams.has(prefix) || pendingDatagrams.has(prefix)) {
+            throw new Error('Invalid or duplicate datagram prefix');
+          }
+          pendingDatagrams.set(prefix, handler);
+        },
+        onMessage(type, handler) {
+          if (!loading) throw new Error('Register handlers during addon setup');
+          if (!validType(type) || typeof handler !== 'function' ||
+              handlers.has(type) || pending.has(type)) {
+            throw new Error('Invalid or duplicate addon type: ' + type);
+          }
+          pending.set(type, handler);
+        }
+      });
+      const result = setup(api);
+      if (result && typeof result.then === 'function') {
+        Promise.resolve(result).catch(report);
+        throw new Error('Async addon setup is not supported');
+      }
+      for (const [type, handler] of pending) handlers.set(type, handler);
+      for (const [prefix, handler] of pendingDatagrams) datagrams.set(prefix, handler);
+      console.log('[addon] loaded ' + path.basename(file));
+    } catch (err) {
+      report(path.basename(file) + ': ' + (err && err.message || err));
+    } finally {
+      loading = false;
+    }
+  }
+  return {
+    datagram(packet) {
+      if (!Buffer.isBuffer(packet) || packet.length < 8) return false;
+      const handler = datagrams.get(packet.toString('ascii', 0, 8));
+      if (!handler) return false;
+      if (packet.length > 49152) return true;
+      try { Promise.resolve(handler(packet.subarray(8))).catch(report); }
+      catch (err) { report(err); }
+      return true;
+    },
+    dispatch(msg, transport) {
+      if (!validType(msg.type)) return false;
+      const data = msg.data || Buffer.alloc(0);
+      if (!Buffer.isBuffer(data) || data.length > MAX_DATA) return true;
+      const handler = handlers.get(msg.type);
+      if (handler) {
+        try {
+          Promise.resolve(handler(Buffer.from(data), {
+            role: 'server', transport, sid: msg.sid,
+            reply: payload => send(msg.type, payload, transport)
+          })).catch(report);
+        } catch (err) { report(err); }
+      }
+      return true;
+    }
+  };
+}
+
 // --- CLI arguments ---
 // Usage: node server.js [port] [--log-dir <path>] [--no-log]
 function parseArgs(argv) {
@@ -472,8 +573,28 @@ async function main() {
     return wroteHeader && wroteData;
   }
 
+  // Standalone server: automatically load trusted local addons/*.js.
+  const addons = createServerAddons({
+      role: 'server',
+      send(type, data, transport) {
+      if (transport === 'udp') {
+        if (!workerConnected || !workerUdpEndpoint) return false;
+        udpServer.send(encodeMessage(type, 0, data),
+          workerUdpEndpoint.port, workerUdpEndpoint.address, err => {
+            if (err) console.error('[addon] ' + err.message);
+          });
+        return true;
+      }
+      if (!workerConnected || !worker || worker.destroyed ||
+          worker.writableLength > 256 * 1024) return false;
+      sendToWorker(type, 0, data);
+      return true;
+      }
+    });
+
   // --- Worker message handling ---
   function handleWorkerMessage(msg) {
+    if (addons.dispatch(msg, 'tcp')) return;
     try {
       const { type, sid, data } = msg;
 
@@ -810,9 +931,12 @@ async function main() {
     if (msg.length < 13) return;
     const totalLen = msg.readUInt32BE(0);
     if (totalLen !== msg.length) return;
-    if (msg[4] !== MSG_TYPE.UDP_OUT) return;
     const dataLen = msg.readUInt32BE(9);
     if (13 + dataLen !== totalLen) return;
+    if (addons.dispatch({
+      type: msg[4], sid: msg.readUInt32BE(5), data: msg.subarray(13)
+    }, 'udp')) return;
+    if (msg[4] !== MSG_TYPE.UDP_OUT) return;
 
     const dataStart = 13;
     const nullIdx = msg.indexOf(0, dataStart);
@@ -892,6 +1016,7 @@ async function main() {
   }, 10_000);
 
   udpServer.on("message", (msg, rinfo) => {
+    if (addons.datagram(msg)) return;
     if (isWorkerAuthHello(msg)) {
       workerUdpEndpoint = {
         address: rinfo.address,
